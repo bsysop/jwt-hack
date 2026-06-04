@@ -989,6 +989,17 @@ fn crack_bruteforce_gpu(
                 offsets.push(candidate_bytes.len() as u32);
             }
 
+            // Progress feedback for long runs.
+            if emit_output && num_batches > 1 {
+                eprint!(
+                    "\r  [GPU] length {} | batch {}/{} | {:.1}% complete",
+                    length,
+                    batch_idx + 1,
+                    num_batches,
+                    (batch_idx as f64 / num_batches as f64) * 100.0
+                );
+            }
+
             // Dispatch GPU.
             let matches = gpu.crack_batch(&candidate_bytes, &offsets)?;
 
@@ -1022,6 +1033,11 @@ fn crack_bruteforce_gpu(
         if found.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
             break;
         }
+    }
+
+    // Clear the progress line.
+    if emit_output {
+        eprint!("\r\x1b[K");
     }
 
     let elapsed = start_time.elapsed();

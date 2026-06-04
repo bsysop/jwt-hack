@@ -41,6 +41,7 @@ mod imp {
 
     pub struct GpuCracker {
         device: Device,
+        cmd_queue: CommandQueue,
         _library: Library,
         pipeline: ComputePipelineState,
         signing_input_buf: Buffer,
@@ -81,6 +82,7 @@ mod imp {
                 })?;
 
             // Upload constant buffers (shared CPU/GPU on Apple Silicon).
+            let cmd_queue = device.new_command_queue();
             let signing_input_buf = Self::make_buffer(&device, signing_input);
             let si_len = signing_input.len() as u32;
             let si_len_buf = Self::make_buffer(&device, &si_len.to_ne_bytes());
@@ -88,6 +90,7 @@ mod imp {
 
             Ok(Self {
                 device,
+                cmd_queue,
                 _library: library,
                 pipeline,
                 signing_input_buf,
@@ -100,9 +103,9 @@ mod imp {
         ///
         /// `candidates` contains packed secret bytes. `offsets` maps thread
         /// indices to byte ranges: candidate `tid` occupies
-        /// `candidates[offsets[tid]..offsets[tid+1]]`.
+        /// `candidates[offsets[tid-1]..offsets[tid]]`.
         ///
-        /// Returns the thread IDs of matching candidates.
+        /// Returns the thread IDs (1-based) of matching candidates.
         pub fn crack_batch(
             &self,
             candidates: &[u8],
@@ -113,56 +116,59 @@ mod imp {
                 return Ok(Vec::new());
             }
 
-            // Upload per-batch buffers.
-            let candidate_buf = Self::make_buffer(&self.device, candidates);
-            let offset_buf = Self::make_buffer(&self.device, offsets);
-            // Zero-initialised results (1 u32 per candidate including slot 0).
-            let results_len = offsets.len() as u64 * mem::size_of::<u32>() as u64;
-            let results_buf = self
-                .device
-                .new_buffer(results_len, MTLResourceOptions::StorageModeShared);
+            // Wrap in an autorelease pool so Metal temporary objects
+            // (command buffer, encoder, per-batch buffers) are freed
+            // immediately rather than accumulating across batches.
+            objc::rc::autoreleasepool(|| {
+                // Upload per-batch buffers.
+                let candidate_buf = Self::make_buffer(&self.device, candidates);
+                let offset_buf = Self::make_buffer(&self.device, offsets);
+                let results_len = offsets.len() as u64 * mem::size_of::<u32>() as u64;
+                let results_buf = self
+                    .device
+                    .new_buffer(results_len, MTLResourceOptions::StorageModeShared);
 
-            // Build command.
-            let cmd_queue = self.device.new_command_queue();
-            let cmd_buf = cmd_queue.new_command_buffer();
-            let encoder = cmd_buf.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.pipeline);
+                // Build command (reuse the persistent command queue).
+                let cmd_buf = self.cmd_queue.new_command_buffer();
+                let encoder = cmd_buf.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.pipeline);
 
-            encoder.set_buffer(0, Some(&self.signing_input_buf), 0);
-            encoder.set_buffer(1, Some(&self.si_len_buf), 0);
-            encoder.set_buffer(2, Some(&self.expected_sig_buf), 0);
-            encoder.set_buffer(3, Some(&candidate_buf), 0);
-            encoder.set_buffer(4, Some(&offset_buf), 0);
-            encoder.set_buffer(5, Some(&results_buf), 0);
+                encoder.set_buffer(0, Some(&self.signing_input_buf), 0);
+                encoder.set_buffer(1, Some(&self.si_len_buf), 0);
+                encoder.set_buffer(2, Some(&self.expected_sig_buf), 0);
+                encoder.set_buffer(3, Some(&candidate_buf), 0);
+                encoder.set_buffer(4, Some(&offset_buf), 0);
+                encoder.set_buffer(5, Some(&results_buf), 0);
 
-            let grid = MTLSize {
-                width: offsets.len() as u64,
-                height: 1,
-                depth: 1,
-            };
-            let tg = MTLSize {
-                width: self
-                    .pipeline
-                    .max_total_threads_per_threadgroup()
-                    .min(grid.width),
-                height: 1,
-                depth: 1,
-            };
-            encoder.dispatch_threads(grid, tg);
-            encoder.end_encoding();
-            cmd_buf.commit();
-            cmd_buf.wait_until_completed();
+                let grid = MTLSize {
+                    width: offsets.len() as u64,
+                    height: 1,
+                    depth: 1,
+                };
+                let tg = MTLSize {
+                    width: self
+                        .pipeline
+                        .max_total_threads_per_threadgroup()
+                        .min(grid.width),
+                    height: 1,
+                    depth: 1,
+                };
+                encoder.dispatch_threads(grid, tg);
+                encoder.end_encoding();
+                cmd_buf.commit();
+                cmd_buf.wait_until_completed();
 
-            // Collect matching indices.
-            let results_ptr = results_buf.contents() as *const u32;
-            let mut matches = Vec::new();
-            for i in 1..offsets.len() {
-                let val = unsafe { *results_ptr.add(i) };
-                if val != 0 {
-                    matches.push(i as u32);
+                // Collect matching indices.
+                let results_ptr = results_buf.contents() as *const u32;
+                let mut matches = Vec::new();
+                for i in 1..offsets.len() {
+                    let val = unsafe { *results_ptr.add(i) };
+                    if val != 0 {
+                        matches.push(i as u32);
+                    }
                 }
-            }
-            Ok(matches)
+                Ok(matches)
+            })
         }
 
         fn make_buffer<T: Sized>(device: &Device, data: &[T]) -> Buffer {

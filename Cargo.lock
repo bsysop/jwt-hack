@@ -1674,6 +1674,7 @@ dependencies = [
  "metal",
  "mimalloc",
  "num-bigint",
+ "objc",
  "openssl",
  "ratatui",
  "rayon",
