@@ -1,3 +1,4 @@
+use base64::Engine;
 use colored::Colorize;
 use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, info};
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use crate::crack;
+use crate::gpu;
 use crate::jwt;
 use crate::utils;
 
@@ -41,6 +43,7 @@ pub struct CrackOptions<'a> {
     pub concurrency: usize,
     pub min: usize,
     pub max: usize,
+    pub gpu: bool,
     pub power: bool,
     pub verbose: bool,
     pub target_field: &'a Option<String>,
@@ -73,6 +76,7 @@ pub fn execute(
     concurrency: usize,
     min: usize,
     max: usize,
+    gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -87,6 +91,7 @@ pub fn execute(
         concurrency,
         min,
         max,
+        gpu,
         power,
         verbose,
         target_field,
@@ -106,6 +111,7 @@ pub fn execute_json(
     concurrency: usize,
     min: usize,
     max: usize,
+    gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -120,6 +126,7 @@ pub fn execute_json(
         concurrency,
         min,
         max,
+        gpu,
         power,
         verbose,
         target_field,
@@ -195,19 +202,35 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
             options.chars.to_string()
         };
 
-        if let Err(e) = crack_bruteforce(
-            options.token,
-            &chars_to_use,
-            options.min,
-            options.max,
-            options.concurrency,
-            options.power,
-            options.verbose,
-            is_jwe,
-            emit_output,
-        ) {
-            if emit_output {
-                utils::log_error(format!("Bruteforce cracking failed: {e}"));
+        if options.gpu {
+            if let Err(e) = crack_bruteforce_gpu(
+                options.token,
+                &chars_to_use,
+                options.min,
+                options.max,
+                options.verbose,
+                is_jwe,
+                emit_output,
+            ) {
+                if emit_output {
+                    utils::log_error(format!("GPU bruteforce cracking failed: {e}"));
+                }
+            }
+        } else {
+            if let Err(e) = crack_bruteforce(
+                options.token,
+                &chars_to_use,
+                options.min,
+                options.max,
+                options.concurrency,
+                options.power,
+                options.verbose,
+                is_jwe,
+                emit_output,
+            ) {
+                if emit_output {
+                    utils::log_error(format!("Bruteforce cracking failed: {e}"));
+                }
             }
         }
     } else {
@@ -247,17 +270,29 @@ fn execute_with_options_json(options: &CrackOptions) -> anyhow::Result<CrackRepo
         } else {
             options.chars.to_string()
         };
-        crack_bruteforce(
-            options.token,
-            &chars_to_use,
-            options.min,
-            options.max,
-            options.concurrency,
-            options.power,
-            options.verbose,
-            is_jwe,
-            emit_output,
-        )
+        if options.gpu {
+            crack_bruteforce_gpu(
+                options.token,
+                &chars_to_use,
+                options.min,
+                options.max,
+                options.verbose,
+                is_jwe,
+                emit_output,
+            )
+        } else {
+            crack_bruteforce(
+                options.token,
+                &chars_to_use,
+                options.min,
+                options.max,
+                options.concurrency,
+                options.power,
+                options.verbose,
+                is_jwe,
+                emit_output,
+            )
+        }
     } else {
         anyhow::bail!("Invalid mode: {}", options.mode);
     }
@@ -850,6 +885,170 @@ fn crack_bruteforce(
     ))
 }
 
+/// GPU-accelerated brute-force via Metal (macOS only).
+///
+/// Each GPU thread handles one candidate secret. The signing input and expected
+/// signature are uploaded once; candidate batches are streamed to the GPU in
+/// ~1M-candidate chunks.
+#[allow(clippy::too_many_arguments)]
+fn crack_bruteforce_gpu(
+    token: &str,
+    chars: &str,
+    min_length: usize,
+    max_length: usize,
+    verbose: bool,
+    is_jwe: bool,
+    emit_output: bool,
+) -> anyhow::Result<CrackReport> {
+    if is_jwe {
+        anyhow::bail!("GPU cracking is currently limited to HS256 JWTs");
+    }
+    if min_length < 1 {
+        anyhow::bail!("min length must be at least 1, got {}", min_length);
+    }
+    if min_length > max_length {
+        anyhow::bail!("min length ({}) cannot exceed max length ({})", min_length, max_length);
+    }
+    if max_length > crack::brute::MAX_BRUTE_LENGTH {
+        anyhow::bail!(
+            "max length {} exceeds supported brute-force limit of {}",
+            max_length,
+            crack::brute::MAX_BRUTE_LENGTH
+        );
+    }
+
+    let start_time = Instant::now();
+
+    // Validate the token is HS256 and extract signing material.
+    // `prepare_hs256_verifier` confirms the algorithm, so GPU gets only
+    // HS256 tokens.
+    let _verifier = jwt::prepare_hs256_verifier(token)
+        .map_err(|e| anyhow::anyhow!("GPU requires HS256 token: {e}"))?;
+
+    // Reconstruct signing_input: base64url(header).base64url(payload)
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() < 3 {
+        anyhow::bail!("Invalid JWT token format");
+    }
+    let signing_input = format!("{}.{}", parts[0], parts[1]).into_bytes();
+
+    // Decode the expected signature from base64url.
+    let expected_sig = Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        parts[2],
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to decode token signature: {e}"))?;
+
+    if expected_sig.len() != 32 {
+        anyhow::bail!("Expected 32-byte HS256 signature, got {}", expected_sig.len());
+    }
+
+    let total_combinations =
+        crack::brute::estimate_combinations(chars.chars().count(), min_length, max_length);
+
+    if emit_output {
+        utils::log_info(format!(
+            "GPU brute-force (Metal): {} total combinations (length {}..{})",
+            total_combinations, min_length, max_length
+        ));
+    }
+
+    // ── Initialise GPU ──────────────────────────────────────────────────
+    let gpu = gpu::GpuCracker::new(&signing_input, &expected_sig)
+        .map_err(|e| anyhow::anyhow!("GPU initialisation failed: {e}"))?;
+
+    let found: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+
+    let char_bytes = crack::brute::charset_bytes(chars);
+    let charset_size = char_bytes.len() as u64;
+    const GPU_BATCH: u64 = gpu::GPU_BATCH_SIZE;
+
+    for length in min_length..=max_length {
+        let total: u64 = charset_size.saturating_pow(length as u32);
+        if total == 0 || total == u64::MAX {
+            continue;
+        }
+        let num_batches = total.div_ceil(GPU_BATCH);
+
+        for batch_idx in 0..num_batches {
+            let start_idx = batch_idx * GPU_BATCH;
+            let end_idx = (start_idx + GPU_BATCH).min(total);
+            let batch_size = (end_idx - start_idx) as usize;
+
+            // Generate candidates for this batch.
+            let mut candidate_bytes: Vec<u8> = Vec::new();
+            // offsets[t] points to start of candidate t; offsets[0] == 0 always
+            let mut offsets: Vec<u32> = Vec::with_capacity(batch_size + 1);
+            offsets.push(0);
+            let mut buf = Vec::<u8>::with_capacity(length * 4);
+
+            for idx in start_idx..end_idx {
+                crack::brute::write_candidate_bytes(idx, &char_bytes, length, &mut buf);
+                candidate_bytes.extend_from_slice(&buf);
+                offsets.push(candidate_bytes.len() as u32);
+            }
+
+            // Dispatch GPU.
+            let matches = gpu.crack_batch(&candidate_bytes, &offsets)?;
+
+            attempts.fetch_add(batch_size, Ordering::Relaxed);
+
+            if !matches.is_empty() {
+                // Reconstruct the winning secret from the first match.
+                // GPU thread IDs are 1-based (tid 0 is reserved), so
+                // subtract 1 to get the candidate index.
+                let winner_tid = matches[0] as usize;
+                if winner_tid > 0 && winner_tid <= batch_size {
+                    let start = offsets[winner_tid - 1] as usize;
+                    let end = offsets[winner_tid] as usize;
+                    let secret =
+                        String::from_utf8(candidate_bytes[start..end].to_vec())
+                            .unwrap_or_default();
+                    if verbose {
+                        log::info!("Found! Token signature secret is {secret} Signature=Verified");
+                    }
+                    *found.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret);
+                }
+                break;
+            }
+
+            // Zeroize candidate data between batches.
+            for b in &mut candidate_bytes {
+                *b = 0;
+            }
+        }
+
+        if found.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            break;
+        }
+    }
+
+    let elapsed = start_time.elapsed();
+    let attempts_total = attempts.load(Ordering::Relaxed);
+
+    let found_arc = Arc::new(found);
+    report_crack_results(
+        &found_arc,
+        elapsed,
+        attempts_total,
+        token,
+        is_jwe,
+        emit_output,
+    );
+
+    Ok(build_crack_report(
+        &found_arc,
+        elapsed,
+        attempts_total,
+        is_jwe,
+        "brute:gpu",
+        None,
+        None,
+        emit_output,
+    ))
+}
+
 /// Targeted field brute-force: modify a specific JWT header/payload field (e.g., kid, jti)
 /// and test each variation against the target. Useful for testing key ID injection,
 /// path traversal in kid, or discovering valid JTI values.
@@ -1326,13 +1525,14 @@ mod tests {
                 &None,
                 "abcdefghijklmnopqrstuvwxyz",
                 &None, // preset
-                10,
-                1, // min
-                4, // max
-                false,
-                false,
-                &None, // target_field
-                &None, // pattern
+                10,     // concurrency
+                1,      // min
+                4,      // max
+                false,  // gpu
+                false,  // power
+                false,  // verbose
+                &None,  // target_field
+                &None,  // pattern
             );
         });
 
@@ -1357,6 +1557,7 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
+            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1389,6 +1590,7 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
+            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1584,6 +1786,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1615,6 +1818,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1645,6 +1849,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,

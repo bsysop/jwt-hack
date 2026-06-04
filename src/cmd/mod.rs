@@ -131,6 +131,10 @@ pub enum Commands {
         #[arg(long, default_value = "4")]
         max: usize,
 
+        /// Use GPU acceleration (Metal on macOS, exclusive — bypasses CPU)
+        #[arg(long)]
+        gpu: bool,
+
         /// Use all CPU cores
         #[arg(long)]
         power: bool,
@@ -342,6 +346,7 @@ pub fn execute() {
                 concurrency,
                 min,
                 max,
+                gpu,
                 power,
                 verbose,
                 target_field,
@@ -355,6 +360,7 @@ pub fn execute() {
                 *concurrency,
                 *min,
                 *max,
+                *gpu,
                 *power,
                 *verbose,
                 target_field,
@@ -496,6 +502,7 @@ pub fn execute() {
             concurrency,
             min,
             max,
+            gpu,
             power,
             verbose,
             target_field,
@@ -510,6 +517,7 @@ pub fn execute() {
                 *concurrency,
                 *min,
                 *max,
+                *gpu,
                 *power,
                 *verbose,
                 target_field,
