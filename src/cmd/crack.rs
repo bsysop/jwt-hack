@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1001,7 +1001,12 @@ fn crack_bruteforce_gpu(
                 offsets.push(candidate_bytes.len() as u32);
             }
 
-            // Progress feedback.
+            // Dispatch GPU.
+            let matches = gpu.crack_batch(&candidate_bytes, &offsets)?;
+
+            attempts.fetch_add(batch_size, Ordering::Relaxed);
+
+            // Progress feedback (after dispatch so rate reflects actual work).
             if emit_output {
                 let elapsed = start_time.elapsed().as_secs_f64();
                 let tested = attempts.load(Ordering::Relaxed);
@@ -1010,23 +1015,31 @@ fn crack_bruteforce_gpu(
                 } else {
                     0.0
                 };
-                let pct = (batch_idx as f64 / num_batches as f64) * 100.0;
+                let pct = ((batch_idx + 1) as f64 / num_batches as f64) * 100.0;
+                let remaining = total.saturating_sub(tested as u64);
+                let eta = if rate > 0.0 {
+                    let secs = remaining as f64 / rate;
+                    if secs >= 3600.0 {
+                        format!("ETA {}h{:02}m", (secs as u64) / 3600, ((secs as u64) % 3600) / 60)
+                    } else if secs >= 60.0 {
+                        format!("ETA {}m{:02}s", (secs as u64) / 60, (secs as u64) % 60)
+                    } else {
+                        format!("ETA {:.0}s", secs)
+                    }
+                } else {
+                    String::new()
+                };
                 eprint!(
-                    "\r  [GPU] len {} | batch {}/{} | {:.1}% | {:.1}M keys/sec",
+                    "\r  [GPU] len {} | batch {}/{} | {:.1}% | {:.1}M/s | {}",
                     length,
                     batch_idx + 1,
                     num_batches,
                     pct,
-                    rate / 1_000_000.0
+                    rate / 1_000_000.0,
+                    eta,
                 );
-                use std::io::Write;
                 let _ = std::io::stderr().flush();
             }
-
-            // Dispatch GPU.
-            let matches = gpu.crack_batch(&candidate_bytes, &offsets)?;
-
-            attempts.fetch_add(batch_size, Ordering::Relaxed);
 
             if !matches.is_empty() {
                 // Reconstruct the winning secret from the first match.

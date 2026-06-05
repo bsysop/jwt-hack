@@ -54,6 +54,7 @@ mod imp {
     use anyhow::{Context, Result};
     use metal::*;
     use std::mem;
+    use std::sync::OnceLock;
 
     /// Source of the Metal compute kernel (`src/gpu/sha256.metal`).
     const KERNEL_SRC: &str = include_str!("sha256.metal");
@@ -61,24 +62,48 @@ mod imp {
     /// Number of candidates to dispatch per GPU invocation.
     pub const GPU_BATCH_SIZE: u64 = 1_000_000;
 
-    /// Check whether a Metal-capable GPU is available on this system.
-    /// Safe to call at any time; does not compile the kernel.
-    pub fn is_available() -> bool {
-        Device::system_default().is_some()
-    }
+    // Cache device info so `is_available` + `availability_reason` don't each
+    // call into Objective-C separately.
+    static DEVICE_INFO: OnceLock<(bool, String)> = OnceLock::new();
 
-    /// Human-readable reason for GPU unavailability, or GPU name if available.
-    pub fn availability_reason() -> String {
-        match Device::system_default() {
-            Some(d) => d.name().into(),
-            None => {
-                if std::path::Path::new("/System/Library/Frameworks/Metal.framework").exists() {
-                    "Metal framework present but no compatible GPU found".to_string()
-                } else {
-                    "Metal framework not available on this platform".to_string()
+    fn device_info() -> &'static (bool, String) {
+        DEVICE_INFO.get_or_init(|| {
+            match Device::system_default() {
+                Some(d) => {
+                    // Basic capability check: the GPU must support Metal 2
+                    // feature sets. Older GPUs (pre-2017) may compile the
+                    // kernel but timeout on large compute dispatches.
+                    let family_ok = d.supports_family(MTLGPUFamily::Common2);
+                    let name: String = d.name().into();
+                    if family_ok {
+                        (true, name)
+                    } else {
+                        (false, format!("GPU {} lacks required Metal feature set (Common2)", name))
+                    }
+                }
+                None => {
+                    let reason = if std::path::Path::new(
+                        "/System/Library/Frameworks/Metal.framework",
+                    ).exists()
+                    {
+                        "Metal framework present but no compatible GPU found".to_string()
+                    } else {
+                        "Metal framework not available on this platform".to_string()
+                    };
+                    (false, reason)
                 }
             }
-        }
+        })
+    }
+
+    /// Check whether a Metal-capable GPU is available on this system.
+    pub fn is_available() -> bool {
+        device_info().0
+    }
+
+    /// Human-readable GPU name, or reason for unavailability.
+    pub fn availability_reason() -> String {
+        device_info().1.clone()
     }
 
     pub struct GpuCracker {
@@ -223,7 +248,7 @@ mod imp {
         }
 
         fn make_buffer<T: Sized>(device: &Device, data: &[T]) -> Buffer {
-            let len = (data.len() * mem::size_of::<T>()) as u64;
+            let len = data.len().saturating_mul(mem::size_of::<T>()) as u64;
             let buf = device.new_buffer(len, MTLResourceOptions::StorageModeShared);
             unsafe {
                 std::ptr::copy_nonoverlapping(

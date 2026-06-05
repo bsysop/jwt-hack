@@ -100,8 +100,8 @@ kernel void hmac_sha256_verify(
 
     // HMAC-SHA256 requires key-hashing when the key exceeds 64 bytes.
     // Implementing full SHA256(key) per thread is too expensive for GPU
-    // brute-force — skip these candidates (they are anyally infeasible
-    // to enumerate at the lengths where they appear).
+    // brute-force — skip these candidates (they are computationally
+    // infeasible to enumerate at the lengths where they appear).
     if (secret_len > 64) return;
 
     // --- Load secret bytes directly into padded key buffer ---
