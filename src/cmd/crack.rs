@@ -43,7 +43,6 @@ pub struct CrackOptions<'a> {
     pub concurrency: usize,
     pub min: usize,
     pub max: usize,
-    pub gpu: bool,
     pub power: bool,
     pub verbose: bool,
     pub target_field: &'a Option<String>,
@@ -76,7 +75,6 @@ pub fn execute(
     concurrency: usize,
     min: usize,
     max: usize,
-    gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -91,7 +89,6 @@ pub fn execute(
         concurrency,
         min,
         max,
-        gpu,
         power,
         verbose,
         target_field,
@@ -111,7 +108,6 @@ pub fn execute_json(
     concurrency: usize,
     min: usize,
     max: usize,
-    gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -126,7 +122,6 @@ pub fn execute_json(
         concurrency,
         min,
         max,
-        gpu,
         power,
         verbose,
         target_field,
@@ -202,7 +197,10 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
             options.chars.to_string()
         };
 
-        if options.gpu && crate::gpu::is_available() {
+        if crate::gpu::is_available() {
+            if emit_output {
+                utils::log_info(format!("Using GPU (Metal — {})", crate::gpu::availability_reason()));
+            }
             if let Err(e) = crack_bruteforce_gpu(
                 options.token,
                 &chars_to_use,
@@ -217,12 +215,6 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
                 }
             }
         } else {
-            if options.gpu && emit_output {
-                utils::log_warning(format!(
-                    "GPU not available ({}) — falling back to CPU",
-                    crate::gpu::availability_reason()
-                ));
-            }
             if let Err(e) = crack_bruteforce(
                 options.token,
                 &chars_to_use,
@@ -276,7 +268,7 @@ fn execute_with_options_json(options: &CrackOptions) -> anyhow::Result<CrackRepo
         } else {
             options.chars.to_string()
         };
-        if options.gpu && crate::gpu::is_available() {
+        if crate::gpu::is_available() {
             crack_bruteforce_gpu(
                 options.token,
                 &chars_to_use,
@@ -1550,7 +1542,6 @@ mod tests {
                 10,     // concurrency
                 1,      // min
                 4,      // max
-                false,  // gpu
                 false,  // power
                 false,  // verbose
                 &None,  // target_field
@@ -1579,7 +1570,6 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
-            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1612,7 +1602,6 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
-            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1808,7 +1797,6 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
-            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1840,7 +1828,6 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
-            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1871,7 +1858,6 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
-            gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
