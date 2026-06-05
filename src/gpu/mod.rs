@@ -1,7 +1,19 @@
-/// GPU-accelerated HMAC-SHA256 cracking via Metal (Apple Silicon / AMD).
+/// GPU-accelerated HMAC-SHA256 cracking via Metal.
 ///
-/// On non-macOS targets this module compiles to a stub that returns
-/// an error explaining that GPU mode requires macOS.
+/// # Compatibility
+///
+/// | Platform                  | GPU            | Supported |
+/// |---------------------------|----------------|-----------|
+/// | macOS Apple Silicon (M1+) | Integrated     | ✅        |
+/// | macOS Intel + AMD GPU     | Dedicated      | ✅        |
+/// | macOS Intel + Intel GPU   | Integrated     | ✅ (weak) |
+/// | macOS Intel + NVIDIA GPU  | Dedicated      | ❌        |
+/// | macOS VM / Hackintosh     | None / partial | ❌        |
+/// | Linux / Windows (any GPU) | —              | ❌        |
+///
+/// On non-macOS targets this module compiles to a stub.  Callers should
+/// check [`is_available`] before attempting GPU cracking and fall back
+/// to the CPU path when it returns `false`.
 
 // ── Stub for non-macOS ──────────────────────────────────────────────────────
 #[cfg(not(target_os = "macos"))]
@@ -10,9 +22,19 @@ mod imp {
 
     pub struct GpuCracker;
 
+    /// Always `false` on non-macOS — Metal does not exist.
+    pub fn is_available() -> bool {
+        false
+    }
+
+    /// Returns a human-readable description of why GPU is unavailable.
+    pub fn availability_reason() -> String {
+        "GPU mode requires macOS with Apple Silicon or an AMD GPU".to_string()
+    }
+
     impl GpuCracker {
         pub fn new(_signing_input: &[u8], _expected_sig: &[u8]) -> Result<Self> {
-            bail!("GPU mode requires macOS with Metal support");
+            anyhow::bail!("{}", availability_reason());
         }
 
         /// Returns the indices (thread IDs) that matched, if any.
@@ -21,7 +43,7 @@ mod imp {
             _candidates: &[u8],
             _offsets: &[u32],
         ) -> Result<Vec<u32>> {
-            bail!("GPU mode requires macOS with Metal support");
+            anyhow::bail!("{}", availability_reason());
         }
     }
 }
@@ -38,6 +60,26 @@ mod imp {
 
     /// Number of candidates to dispatch per GPU invocation.
     pub const GPU_BATCH_SIZE: u64 = 1_000_000;
+
+    /// Check whether a Metal-capable GPU is available on this system.
+    /// Safe to call at any time; does not compile the kernel.
+    pub fn is_available() -> bool {
+        Device::system_default().is_some()
+    }
+
+    /// Human-readable reason for GPU unavailability, or GPU name if available.
+    pub fn availability_reason() -> String {
+        match Device::system_default() {
+            Some(d) => d.name().into(),
+            None => {
+                if std::path::Path::new("/System/Library/Frameworks/Metal.framework").exists() {
+                    "Metal framework present but no compatible GPU found".to_string()
+                } else {
+                    "Metal framework not available on this platform".to_string()
+                }
+            }
+        }
+    }
 
     pub struct GpuCracker {
         device: Device,

@@ -131,7 +131,9 @@ pub enum Commands {
         #[arg(long, default_value = "4")]
         max: usize,
 
-        /// Use GPU acceleration (Metal on macOS, exclusive — bypasses CPU)
+        /// Use GPU acceleration (Metal on macOS Apple Silicon / AMD).
+        /// Auto-detects compatible hardware; falls back to CPU with
+        /// a warning when no Metal GPU is available.
         #[arg(long)]
         gpu: bool,
 

@@ -202,7 +202,7 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
             options.chars.to_string()
         };
 
-        if options.gpu {
+        if options.gpu && crate::gpu::is_available() {
             if let Err(e) = crack_bruteforce_gpu(
                 options.token,
                 &chars_to_use,
@@ -217,6 +217,12 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
                 }
             }
         } else {
+            if options.gpu && emit_output {
+                utils::log_warning(format!(
+                    "GPU not available ({}) — falling back to CPU",
+                    crate::gpu::availability_reason()
+                ));
+            }
             if let Err(e) = crack_bruteforce(
                 options.token,
                 &chars_to_use,
@@ -270,7 +276,7 @@ fn execute_with_options_json(options: &CrackOptions) -> anyhow::Result<CrackRepo
         } else {
             options.chars.to_string()
         };
-        if options.gpu {
+        if options.gpu && crate::gpu::is_available() {
             crack_bruteforce_gpu(
                 options.token,
                 &chars_to_use,
