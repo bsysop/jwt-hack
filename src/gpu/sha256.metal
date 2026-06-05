@@ -98,17 +98,16 @@ kernel void hmac_sha256_verify(
     if (end <= start) return;
     uint secret_len = end - start;
 
-    // --- Load secret bytes ---
-    uchar secret[64] = {0};
-    for (uint i = 0; i < secret_len && i < 64; i++) {
-        secret[i] = candidates[start + i];
-    }
+    // HMAC-SHA256 requires key-hashing when the key exceeds 64 bytes.
+    // Implementing full SHA256(key) per thread is too expensive for GPU
+    // brute-force — skip these candidates (they are anyally infeasible
+    // to enumerate at the lengths where they appear).
+    if (secret_len > 64) return;
 
-    // --- HMAC-SHA256: inner hash H((K ^ ipad) || message) ---
-    // Build padded key block: K' = secret padded to 64 bytes with zeros
+    // --- Load secret bytes directly into padded key buffer ---
     uchar k_padded[64] = {0};
-    for (uint i = 0; i < secret_len && i < 64; i++) {
-        k_padded[i] = secret[i];
+    for (uint i = 0; i < secret_len; i++) {
+        k_padded[i] = candidates[start + i];
     }
 
     // inner key block: K' ^ 0x36 (ipad)
@@ -124,13 +123,9 @@ kernel void hmac_sha256_verify(
     uint state[8];
     sha256_single_block(state, inner_block);
 
-    // Step 2: continue hashing signing_input + SHA256 padding
+    // Step 2: continue hashing signing_input + SHA256 padding.
+    // Process in 64-byte blocks.
     uint si_len_val = si_len[0];
-    uint total_remaining = si_len_val + 65; // 1 byte for 0x80 marker + 8 bytes for length
-
-    // Allocate buffer for remaining data + padding
-    // Max needed: signing_input (up to ~16KB) + 9 bytes padding
-    // We process in 64-byte blocks
     uchar buf[64];
     uint buf_pos = 0;
 

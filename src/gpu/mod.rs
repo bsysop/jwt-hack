@@ -169,6 +169,15 @@ mod imp {
                 let results_buf = self
                     .device
                     .new_buffer(results_len, MTLResourceOptions::StorageModeShared);
+                // Metal does not guarantee zero-initialised buffers — stale
+                // values from a prior dispatch could cause a false positive.
+                unsafe {
+                    std::ptr::write_bytes(
+                        results_buf.contents() as *mut u8,
+                        0,
+                        results_len as usize,
+                    );
+                }
 
                 // Build command (reuse the persistent command queue).
                 let cmd_buf = self.cmd_queue.new_command_buffer();

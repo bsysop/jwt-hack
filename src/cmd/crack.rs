@@ -43,6 +43,7 @@ pub struct CrackOptions<'a> {
     pub concurrency: usize,
     pub min: usize,
     pub max: usize,
+    pub no_gpu: bool,
     pub power: bool,
     pub verbose: bool,
     pub target_field: &'a Option<String>,
@@ -75,6 +76,7 @@ pub fn execute(
     concurrency: usize,
     min: usize,
     max: usize,
+    no_gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -89,6 +91,7 @@ pub fn execute(
         concurrency,
         min,
         max,
+        no_gpu,
         power,
         verbose,
         target_field,
@@ -108,6 +111,7 @@ pub fn execute_json(
     concurrency: usize,
     min: usize,
     max: usize,
+    no_gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -122,6 +126,7 @@ pub fn execute_json(
         concurrency,
         min,
         max,
+        no_gpu,
         power,
         verbose,
         target_field,
@@ -197,11 +202,13 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
             options.chars.to_string()
         };
 
-        if crate::gpu::is_available() {
+        // Try GPU first; if it fails (driver issue, kernel compile error,
+        // unsupported algo) fall back to CPU automatically.
+        if !options.no_gpu && crate::gpu::is_available() {
             if emit_output {
                 utils::log_info(format!("Using GPU (Metal — {})", crate::gpu::availability_reason()));
             }
-            if let Err(e) = crack_bruteforce_gpu(
+            match crack_bruteforce_gpu(
                 options.token,
                 &chars_to_use,
                 options.min,
@@ -210,25 +217,30 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
                 is_jwe,
                 emit_output,
             ) {
-                if emit_output {
-                    utils::log_error(format!("GPU bruteforce cracking failed: {e}"));
+                Ok(_) => return, // GPU succeeded
+                Err(e) => {
+                    if emit_output {
+                        utils::log_warning(format!(
+                            "GPU failed ({}), falling back to CPU",
+                            e
+                        ));
+                    }
                 }
             }
-        } else {
-            if let Err(e) = crack_bruteforce(
-                options.token,
-                &chars_to_use,
-                options.min,
-                options.max,
-                options.concurrency,
-                options.power,
-                options.verbose,
-                is_jwe,
-                emit_output,
-            ) {
-                if emit_output {
-                    utils::log_error(format!("Bruteforce cracking failed: {e}"));
-                }
+        }
+        if let Err(e) = crack_bruteforce(
+            options.token,
+            &chars_to_use,
+            options.min,
+            options.max,
+            options.concurrency,
+            options.power,
+            options.verbose,
+            is_jwe,
+            emit_output,
+        ) {
+            if emit_output {
+                utils::log_error(format!("Bruteforce cracking failed: {e}"));
             }
         }
     } else {
@@ -268,8 +280,8 @@ fn execute_with_options_json(options: &CrackOptions) -> anyhow::Result<CrackRepo
         } else {
             options.chars.to_string()
         };
-        if crate::gpu::is_available() {
-            crack_bruteforce_gpu(
+        if !options.no_gpu && crate::gpu::is_available() {
+            match crack_bruteforce_gpu(
                 options.token,
                 &chars_to_use,
                 options.min,
@@ -277,20 +289,22 @@ fn execute_with_options_json(options: &CrackOptions) -> anyhow::Result<CrackRepo
                 options.verbose,
                 is_jwe,
                 emit_output,
-            )
-        } else {
-            crack_bruteforce(
-                options.token,
-                &chars_to_use,
-                options.min,
-                options.max,
-                options.concurrency,
-                options.power,
-                options.verbose,
-                is_jwe,
-                emit_output,
-            )
+            ) {
+                Ok(report) => return Ok(report),
+                Err(_) => { /* fall through to CPU */ }
+            }
         }
+        crack_bruteforce(
+            options.token,
+            &chars_to_use,
+            options.min,
+            options.max,
+            options.concurrency,
+            options.power,
+            options.verbose,
+            is_jwe,
+            emit_output,
+        )
     } else {
         anyhow::bail!("Invalid mode: {}", options.mode);
     }
@@ -987,15 +1001,26 @@ fn crack_bruteforce_gpu(
                 offsets.push(candidate_bytes.len() as u32);
             }
 
-            // Progress feedback for long runs.
-            if emit_output && num_batches > 1 {
+            // Progress feedback.
+            if emit_output {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                let tested = attempts.load(Ordering::Relaxed);
+                let rate = if elapsed > 0.0 {
+                    tested as f64 / elapsed
+                } else {
+                    0.0
+                };
+                let pct = (batch_idx as f64 / num_batches as f64) * 100.0;
                 eprint!(
-                    "\r  [GPU] length {} | batch {}/{} | {:.1}% complete",
+                    "\r  [GPU] len {} | batch {}/{} | {:.1}% | {:.1}M keys/sec",
                     length,
                     batch_idx + 1,
                     num_batches,
-                    (batch_idx as f64 / num_batches as f64) * 100.0
+                    pct,
+                    rate / 1_000_000.0
                 );
+                use std::io::Write;
+                let _ = std::io::stderr().flush();
             }
 
             // Dispatch GPU.
@@ -1022,10 +1047,8 @@ fn crack_bruteforce_gpu(
                 break;
             }
 
-            // Zeroize candidate data between batches.
-            for b in &mut candidate_bytes {
-                *b = 0;
-            }
+            // candidate_bytes is dropped here and re-allocated next
+            // iteration — avoids an O(n) byte-by-byte zeroing pass.
         }
 
         if found.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
@@ -1542,6 +1565,7 @@ mod tests {
                 10,     // concurrency
                 1,      // min
                 4,      // max
+                false,  // no_gpu
                 false,  // power
                 false,  // verbose
                 &None,  // target_field
@@ -1570,6 +1594,7 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1602,6 +1627,7 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1797,6 +1823,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1828,6 +1855,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1858,6 +1886,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,

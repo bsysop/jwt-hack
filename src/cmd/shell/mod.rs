@@ -718,6 +718,7 @@ fn handle_crack(parts: &[&str], app: &mut App, tx: &mpsc::Sender<AsyncResult>) {
                 20,
                 1,  // min
                 4,  // max
+                false, // no_gpu
                 false, // power
                 false, // verbose
                 &None,
