@@ -929,6 +929,12 @@ fn crack_bruteforce_gpu(
     let (signing_input, expected_sig) = jwt::prepare_hs256_verifier(token)
         .map_err(|e| anyhow::anyhow!("GPU requires HS256 token: {e}"))?
         .into_parts();
+    if expected_sig.len() != 32 {
+        anyhow::bail!(
+            "Expected 32-byte HS256 signature, got {} bytes",
+            expected_sig.len()
+        );
+    }
 
     let total_combinations =
         crack::brute::estimate_combinations(chars.chars().count(), min_length, max_length);
@@ -949,18 +955,16 @@ fn crack_bruteforce_gpu(
 
     let char_bytes = crack::brute::charset_bytes(chars);
     let charset_size = char_bytes.len() as u64;
-    const GPU_BATCH: u64 = gpu::GPU_BATCH_SIZE;
-
     'length: for length in min_length..=max_length {
         let total: u64 = charset_size.saturating_pow(length as u32);
         if total == 0 || total == u64::MAX {
             continue;
         }
-        let num_batches = total.div_ceil(GPU_BATCH);
+        let num_batches = total.div_ceil(gpu::GPU_BATCH_SIZE);
 
         for batch_idx in 0..num_batches {
-            let start_idx = batch_idx * GPU_BATCH;
-            let end_idx = (start_idx + GPU_BATCH).min(total);
+            let start_idx = batch_idx * gpu::GPU_BATCH_SIZE;
+            let end_idx = (start_idx + gpu::GPU_BATCH_SIZE).min(total);
             let batch_size = (end_idx - start_idx) as usize;
 
             // Generate candidates for this batch.
@@ -991,7 +995,7 @@ fn crack_bruteforce_gpu(
                     0.0
                 };
                 let pct = ((batch_idx + 1) as f64 / num_batches as f64) * 100.0;
-                let remaining = total.saturating_sub(tested as u64);
+                let remaining = total_combinations.saturating_sub(tested as u64);
                 let eta = if rate > 0.0 {
                     let secs = remaining as f64 / rate;
                     if secs >= 3600.0 {
