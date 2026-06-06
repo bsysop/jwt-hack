@@ -1,4 +1,3 @@
-use base64::Engine;
 use colored::Colorize;
 use indicatif::{HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
 use log::{error, info};
@@ -707,21 +706,8 @@ fn crack_dictionary(
     ))
 }
 
-/// Streaming brute-force: each rayon worker materializes candidates from an
-/// integer index into a reusable byte buffer, avoiding the per-candidate
-/// `String` allocation of the legacy `Vec<String>` chunk path.
-#[allow(clippy::too_many_arguments)]
-fn crack_bruteforce(
-    token: &str,
-    chars: &str,
-    min_length: usize,
-    max_length: usize,
-    concurrency: usize,
-    power: bool,
-    verbose: bool,
-    is_jwe: bool,
-    emit_output: bool,
-) -> anyhow::Result<CrackReport> {
+/// Validate min/max length bounds shared by CPU and GPU brute-force paths.
+fn validate_brute_lengths(min_length: usize, max_length: usize) -> anyhow::Result<()> {
     if min_length < 1 {
         anyhow::bail!("min length must be at least 1, got {}", min_length);
     }
@@ -739,6 +725,25 @@ fn crack_bruteforce(
             crack::brute::MAX_BRUTE_LENGTH
         );
     }
+    Ok(())
+}
+
+/// Streaming brute-force: each rayon worker materializes candidates from an
+/// integer index into a reusable byte buffer, avoiding the per-candidate
+/// `String` allocation of the legacy `Vec<String>` chunk path.
+#[allow(clippy::too_many_arguments)]
+fn crack_bruteforce(
+    token: &str,
+    chars: &str,
+    min_length: usize,
+    max_length: usize,
+    concurrency: usize,
+    power: bool,
+    verbose: bool,
+    is_jwe: bool,
+    emit_output: bool,
+) -> anyhow::Result<CrackReport> {
+    validate_brute_lengths(min_length, max_length)?;
 
     let start_time = Instant::now();
     let multi = if emit_output {
@@ -915,45 +920,15 @@ fn crack_bruteforce_gpu(
     if is_jwe {
         anyhow::bail!("GPU cracking is currently limited to HS256 JWTs");
     }
-    if min_length < 1 {
-        anyhow::bail!("min length must be at least 1, got {}", min_length);
-    }
-    if min_length > max_length {
-        anyhow::bail!("min length ({}) cannot exceed max length ({})", min_length, max_length);
-    }
-    if max_length > crack::brute::MAX_BRUTE_LENGTH {
-        anyhow::bail!(
-            "max length {} exceeds supported brute-force limit of {}",
-            max_length,
-            crack::brute::MAX_BRUTE_LENGTH
-        );
-    }
+    validate_brute_lengths(min_length, max_length)?;
 
     let start_time = Instant::now();
 
-    // Validate the token is HS256 and extract signing material.
-    // `prepare_hs256_verifier` confirms the algorithm, so GPU gets only
-    // HS256 tokens.
-    let _verifier = jwt::prepare_hs256_verifier(token)
-        .map_err(|e| anyhow::anyhow!("GPU requires HS256 token: {e}"))?;
-
-    // Reconstruct signing_input: base64url(header).base64url(payload)
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() < 3 {
-        anyhow::bail!("Invalid JWT token format");
-    }
-    let signing_input = format!("{}.{}", parts[0], parts[1]).into_bytes();
-
-    // Decode the expected signature from base64url.
-    let expected_sig = Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        parts[2],
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to decode token signature: {e}"))?;
-
-    if expected_sig.len() != 32 {
-        anyhow::bail!("Expected 32-byte HS256 signature, got {}", expected_sig.len());
-    }
+    // Validate token is HS256 and extract signing material directly from
+    // the verifier — avoids re-parsing the token and re-decoding base64.
+    let (signing_input, expected_sig) = jwt::prepare_hs256_verifier(token)
+        .map_err(|e| anyhow::anyhow!("GPU requires HS256 token: {e}"))?
+        .into_parts();
 
     let total_combinations =
         crack::brute::estimate_combinations(chars.chars().count(), min_length, max_length);
@@ -976,7 +951,7 @@ fn crack_bruteforce_gpu(
     let charset_size = char_bytes.len() as u64;
     const GPU_BATCH: u64 = gpu::GPU_BATCH_SIZE;
 
-    for length in min_length..=max_length {
+    'length: for length in min_length..=max_length {
         let total: u64 = charset_size.saturating_pow(length as u32);
         if total == 0 || total == u64::MAX {
             continue;
@@ -1023,8 +998,10 @@ fn crack_bruteforce_gpu(
                         format!("ETA {}h{:02}m", (secs as u64) / 3600, ((secs as u64) % 3600) / 60)
                     } else if secs >= 60.0 {
                         format!("ETA {}m{:02}s", (secs as u64) / 60, (secs as u64) % 60)
-                    } else {
+                    } else if secs >= 1.0 {
                         format!("ETA {:.0}s", secs)
+                    } else {
+                        String::from("ETA <1s")
                     }
                 } else {
                     String::new()
@@ -1057,15 +1034,11 @@ fn crack_bruteforce_gpu(
                     }
                     *found.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret);
                 }
-                break;
+                break 'length;
             }
 
             // candidate_bytes is dropped here and re-allocated next
             // iteration — avoids an O(n) byte-by-byte zeroing pass.
-        }
-
-        if found.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-            break;
         }
     }
 

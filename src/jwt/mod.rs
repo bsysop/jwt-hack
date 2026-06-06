@@ -536,6 +536,14 @@ impl Hs256Verifier {
         calculated.zeroize();
         matches
     }
+
+    /// Consume the verifier and return the pre-computed signing input and
+    /// expected signature.  Useful for GPU upload where the caller needs the
+    /// raw material rather than the `verify` helper.
+    #[allow(dead_code)]
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
+        (self.signing_input, self.expected_sig)
+    }
 }
 
 /// Build an [`Hs256Verifier`] from a JWT.
