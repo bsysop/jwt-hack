@@ -210,14 +210,13 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
             return;
         }
 
-        // Try the Metal GPU first for HS256 tokens; on any failure (no device,
+        // Try the GPU first for HS256 tokens; on any failure (no device,
         // kernel compile error, unsupported token) fall back to the CPU path.
+        // The backend name (Metal / Vulkan / DX12 / GL) comes from the adapter
+        // description in `availability_reason`.
         if gpu_brute_eligible(options, &chars_to_use, is_jwe) {
             if emit_output {
-                utils::log_info(format!(
-                    "Using GPU (Metal — {})",
-                    gpu::availability_reason()
-                ));
+                utils::log_info(format!("Using GPU ({})", gpu::availability_reason()));
             }
             match crack_bruteforce_gpu(
                 options.token,
@@ -902,7 +901,7 @@ fn crack_bruteforce_gpu(
         crack::brute::estimate_combinations(single.len(), min_length, max_length);
     if emit_output {
         utils::log_info(format!(
-            "GPU brute-force (Metal): {} total combinations (length {}..{})",
+            "GPU brute-force: {} total combinations (length {}..{})",
             total_combinations, min_length, max_length
         ));
     }
@@ -2202,10 +2201,10 @@ mod tests {
     /// secret, asserting the matching 1-based thread id comes back. Skips when
     /// no Metal device is available (e.g. a GPU-less CI runner).
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", feature = "gpu-wgpu"))]
     fn test_gpu_crack_batch_matches_known_secret() {
         if !gpu::is_available() {
-            eprintln!("skipping: no Metal GPU available");
+            eprintln!("skipping: no GPU available");
             return;
         }
 
@@ -2237,10 +2236,10 @@ mod tests {
     /// silently producing false negatives on the default macOS path. Skips
     /// gracefully when no Metal device is present.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", feature = "gpu-wgpu"))]
     fn test_gpu_and_cpu_bruteforce_agree() {
         if !gpu::is_available() {
-            eprintln!("skipping: no Metal GPU available");
+            eprintln!("skipping: no GPU available");
             return;
         }
 

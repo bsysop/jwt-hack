@@ -42,6 +42,20 @@ rsa = { version = "0.9", features = ["pem"] }
 zeroize = "1.8.2"
 mimalloc = { version = "0.1", default-features = false }
 
+# Optional cross-vendor GPU backend (NVIDIA/AMD/Intel on Linux/Windows, and
+# macOS via Metal). Opt-in through the `gpu-wgpu` feature; kept out of the
+# default build so published packages and the native Metal path are unaffected.
+wgpu = { version = "30.0.1", optional = true }
+pollster = { version = "1.0.1", optional = true }
+
+[features]
+# Cross-vendor GPU brute force via wgpu/WGSL. When enabled it replaces the
+# native macOS Metal backend (so the same WGSL kernel can be exercised on
+# macOS too). Requires a Vulkan/DX12/Metal/GL-capable GPU and driver at run
+# time; falls back to the CPU path when no usable adapter is found. MSRV for
+# this feature follows wgpu (currently 1.87.0, the project baseline).
+gpu-wgpu = ["dep:wgpu", "dep:pollster"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33"
 objc = "0.2"

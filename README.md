@@ -67,7 +67,7 @@ docker pull hahwul/jwt-hack:v2.6.0
 | Encode  | JWT/JWE Encoder              | Secret based / Key based / Algorithm / Custom Header / DEFLATE Compression / JWE |
 | Decode  | JWT/JWE Decoder              | Algorithm, Issued At Check, DEFLATE Compression, JWE Structure |
 | Verify  | JWT Verifier                 | Secret based / Key based (for asymmetric algorithms)         |
-| Crack   | Secret Cracker               | Dictionary Attack / Brute Force (GPU-accelerated on macOS) / DEFLATE Compression |
+| Crack   | Secret Cracker               | Dictionary Attack / Brute Force (GPU-accelerated) / DEFLATE Compression |
 | Payload | JWT Attack Payload Generator | none / jku&x5u / alg_confusion (signed via `--public-key`) / kid & claim injection / claims tampering / signature malleability / JWE probes / x5c / cty |
 | Scan    | Vulnerability Scanner        | Automated security checks for common JWT vulnerabilities     |
 | Server  | API Server                    | Run API Server Mode (http://localhost:3000)                 |
@@ -156,21 +156,37 @@ jwt-hack crack -m brute COMPRESSED_JWT_TOKEN --max=4
 jwt-hack crack -m brute JWT_TOKEN --max=4 --no-gpu
 ```
 
-#### GPU acceleration (macOS)
+#### GPU acceleration
 
-On macOS, **HS256 brute-force cracking is GPU-accelerated by default** using a Metal compute backend. It automatically falls back to the CPU when no usable Metal device is present, and you can force the CPU path with `--no-gpu`.
+**HS256 brute-force cracking can run on the GPU.** The search automatically falls back to the CPU when no usable GPU is present, and `--no-gpu` always forces the CPU path. Only HS256 tokens use the GPU; other algorithms and JWE always use the CPU.
 
-- **Available only when built from source of this fork** ([`bsysop/jwt-hack`](https://github.com/bsysop/jwt-hack)). The published packages (crates.io, Homebrew, Snapcraft, Chocolatey, Docker) are upstream and CPU-only.
-- **Supported GPUs:** Apple Silicon (M1+) and Intel Macs with an AMD/Intel GPU. NVIDIA GPUs and VM/Hackintosh setups are unsupported and fall back to the CPU automatically.
-- **Linux / Windows:** the GPU path is unavailable; brute force transparently uses the CPU and `--no-gpu` is a no-op.
-- **Scope:** only HS256 tokens use the GPU; other algorithms and JWE always use the CPU path.
+> GPU support is **available only when built from source of this fork** ([`bsysop/jwt-hack`](https://github.com/bsysop/jwt-hack)). The published packages (crates.io, Homebrew, Snapcraft, Chocolatey, Docker) are upstream and CPU-only.
+
+There are two backends:
+
+**1. Metal (macOS, default).** On macOS a Metal compute backend is compiled in automatically and used by default — no feature flag needed.
 
 ```bash
-# Build the GPU-enabled binary from source on macOS (Metal support is compiled in automatically)
 git clone https://github.com/bsysop/jwt-hack
 cd jwt-hack
 cargo build --release
 ```
+
+- **Supported GPUs:** Apple Silicon (M1+) and Intel Macs with an AMD/Intel GPU. NVIDIA GPUs and VM/Hackintosh setups are unsupported and fall back to the CPU automatically.
+
+**2. Cross-vendor wgpu/WGSL (opt-in, any OS).** The `gpu-wgpu` feature builds a portable backend that runs the same kernel through Vulkan, DX12, Metal or OpenGL — so **NVIDIA, AMD and Intel GPUs on Linux and Windows** are supported in addition to Apple GPUs.
+
+```bash
+git clone https://github.com/bsysop/jwt-hack
+cd jwt-hack
+cargo build --release --features gpu-wgpu
+```
+
+- **Requirements:** a working GPU driver exposing Vulkan, DX12, Metal or GL (e.g. the NVIDIA proprietary driver or Mesa on Linux). No vendor SDK (CUDA/ROCm) is required.
+- **Precedence:** when `gpu-wgpu` is enabled it replaces the Metal backend, so the same WGSL kernel can be exercised on macOS too.
+- **Fallback:** if no usable GPU adapter is found, brute force transparently uses the CPU and `--no-gpu` is a no-op.
+
+Without a GPU backend compiled in (the default build on Linux/Windows), brute force runs on the CPU and `--no-gpu` is a no-op.
 
 ### Generate payloads
 

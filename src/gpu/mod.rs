@@ -11,12 +11,17 @@
 /// | macOS VM / Hackintosh     | None / partial | ❌        |
 /// | Linux / Windows (any GPU) | —              | ❌        |
 ///
-/// On non-macOS targets this module compiles to a stub.  Callers should
+/// The table above describes the **default** backend (native Metal on macOS,
+/// a stub elsewhere). Building with the optional `gpu-wgpu` feature replaces it
+/// with a cross-vendor wgpu/WGSL backend that also covers NVIDIA, AMD and Intel
+/// GPUs on Linux and Windows (and macOS via Metal); see [`imp`].
+///
+/// On an unsupported target this module compiles to a stub.  Callers should
 /// check [`is_available`] before attempting GPU cracking and fall back
 /// to the CPU path when it returns `false`.
 
-// ── Stub for non-macOS ──────────────────────────────────────────────────────
-#[cfg(not(target_os = "macos"))]
+// ── Stub (no GPU backend compiled in) ───────────────────────────────────────
+#[cfg(all(not(target_os = "macos"), not(feature = "gpu-wgpu")))]
 mod imp {
     use anyhow::Result;
 
@@ -48,8 +53,8 @@ mod imp {
     }
 }
 
-// ── Metal implementation for macOS ──────────────────────────────────────────
-#[cfg(target_os = "macos")]
+// ── Metal implementation for macOS (default backend) ────────────────────────
+#[cfg(all(target_os = "macos", not(feature = "gpu-wgpu")))]
 mod imp {
     use anyhow::{Context, Result};
     use metal::*;
@@ -271,6 +276,339 @@ mod imp {
                 );
             }
             buf
+        }
+    }
+}
+
+// ── Cross-vendor wgpu/WGSL implementation (opt-in: `--features gpu-wgpu`) ─────
+//
+// Selected on *any* OS when the `gpu-wgpu` feature is enabled, replacing the
+// Metal backend above. wgpu dispatches the shared WGSL kernel through Vulkan,
+// DX12, Metal or GL, so NVIDIA / AMD / Intel GPUs on Linux and Windows are
+// covered in addition to Apple GPUs. The public surface is identical to the
+// Metal backend so `cmd::crack` needs no backend-specific code.
+#[cfg(feature = "gpu-wgpu")]
+mod imp {
+    use anyhow::{Context, Result};
+    use std::sync::OnceLock;
+    use wgpu::util::DeviceExt;
+
+    /// WGSL source of the compute kernel (`src/gpu/hmac_sha256.wgsl`).
+    const KERNEL_SRC: &str = include_str!("hmac_sha256.wgsl");
+
+    /// Number of candidates dispatched per GPU invocation. Mirrors the Metal
+    /// backend so callers can reference `gpu::GPU_BATCH_SIZE` on every platform.
+    pub const GPU_BATCH_SIZE: u64 = 1_000_000;
+
+    /// Threads per workgroup — must match `@workgroup_size` in the WGSL kernel.
+    const WORKGROUP_SIZE: u32 = 64;
+
+    // Cache adapter probe so `is_available` + `availability_reason` don't each
+    // spin up an instance and enumerate adapters.
+    static ADAPTER_INFO: OnceLock<(bool, String)> = OnceLock::new();
+
+    fn new_instance() -> wgpu::Instance {
+        // Compute-only: no windowing/display handle needed.
+        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env())
+    }
+
+    fn request_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter> {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+            ..Default::default()
+        }))
+        .map_err(|e| anyhow::anyhow!("no compatible GPU adapter found: {e}"))
+    }
+
+    fn adapter_info() -> &'static (bool, String) {
+        ADAPTER_INFO.get_or_init(|| match request_adapter(&new_instance()) {
+            Ok(adapter) => {
+                let info = adapter.get_info();
+                (
+                    true,
+                    format!(
+                        "{} ({:?}, {:?} backend)",
+                        info.name, info.device_type, info.backend
+                    ),
+                )
+            }
+            Err(e) => (false, e.to_string()),
+        })
+    }
+
+    /// Whether a usable GPU adapter (any wgpu backend) is available.
+    pub fn is_available() -> bool {
+        adapter_info().0
+    }
+
+    /// Human-readable adapter description, or the reason none is usable.
+    pub fn availability_reason() -> String {
+        adapter_info().1.clone()
+    }
+
+    pub struct GpuCracker {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        pipeline: wgpu::ComputePipeline,
+        bind_group_layout: wgpu::BindGroupLayout,
+        signing_input_buf: wgpu::Buffer,
+        params_buf: wgpu::Buffer,
+        expected_sig_buf: wgpu::Buffer,
+        si_len: u32,
+    }
+
+    /// Pack raw bytes for upload into a WGSL `array<u32>` (little-endian words).
+    /// Buffers must be a non-zero multiple of 4 bytes; the tail is zero-padded
+    /// and never read because the kernel bounds every access by `offsets`.
+    fn pad_to_words(bytes: &[u8]) -> Vec<u8> {
+        let mut v = bytes.to_vec();
+        while v.len() % 4 != 0 {
+            v.push(0);
+        }
+        if v.is_empty() {
+            v.extend_from_slice(&[0u8; 4]);
+        }
+        v
+    }
+
+    /// Encode the 32-byte signature as 8 big-endian words so the kernel can
+    /// compare the final SHA-256 state word-for-word (matching the WGSL, which
+    /// keeps the digest in big-endian word form).
+    fn expected_sig_words(expected_sig: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(32);
+        for chunk in expected_sig.chunks(4) {
+            let mut w = [0u8; 4];
+            w[..chunk.len()].copy_from_slice(chunk);
+            out.extend_from_slice(&u32::from_be_bytes(w).to_le_bytes());
+        }
+        out
+    }
+
+    impl GpuCracker {
+        pub fn new(signing_input: &[u8], expected_sig: &[u8]) -> Result<Self> {
+            let instance = new_instance();
+            let adapter = request_adapter(&instance)?;
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("jwt-hack-gpu"),
+                    required_features: wgpu::Features::empty(),
+                    // Use the adapter's full limits so large candidate buffers
+                    // (up to GPU_BATCH_SIZE * max_len bytes) are not rejected by
+                    // the conservative WebGPU defaults.
+                    required_limits: adapter.limits(),
+                    memory_hints: wgpu::MemoryHints::Performance,
+                    trace: wgpu::Trace::Off,
+                    ..Default::default()
+                }))
+                .context("failed to create wgpu device")?;
+
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("hmac_sha256"),
+                source: wgpu::ShaderSource::Wgsl(KERNEL_SRC.into()),
+            });
+
+            let bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("hmac_sha256_bgl"),
+                    entries: &[
+                        storage_entry(0, true),  // signing_input
+                        uniform_entry(1),        // params
+                        storage_entry(2, true),  // expected_sig
+                        storage_entry(3, true),  // candidates
+                        storage_entry(4, true),  // offsets
+                        storage_entry(5, false), // results (read_write)
+                    ],
+                });
+
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("hmac_sha256_pl"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("hmac_sha256_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("hmac_sha256_verify"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+            let signing_input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("signing_input"),
+                contents: &pad_to_words(signing_input),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let expected_sig_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("expected_sig"),
+                contents: &expected_sig_words(expected_sig),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            // Params is {si_len, num_threads}; num_threads is rewritten per
+            // batch. Padded to 16 bytes to satisfy uniform-buffer alignment.
+            let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            Ok(Self {
+                device,
+                queue,
+                pipeline,
+                bind_group_layout,
+                signing_input_buf,
+                params_buf,
+                expected_sig_buf,
+                si_len: signing_input.len() as u32,
+            })
+        }
+
+        /// Run HMAC-SHA256 verification on a batch of candidate secrets.
+        ///
+        /// Layout matches the Metal backend: `candidates` is packed secret
+        /// bytes and candidate `tid-1` occupies `candidates[offsets[tid-1]..
+        /// offsets[tid]]`. Returns the 1-based thread ids that matched.
+        pub fn crack_batch(&self, candidates: &[u8], offsets: &[u32]) -> Result<Vec<u32>> {
+            let num_threads = offsets.len() as u32; // slot 0 is reserved
+            if num_threads <= 1 {
+                return Ok(Vec::new());
+            }
+
+            let candidate_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("candidates"),
+                    contents: &pad_to_words(candidates),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+            let offset_bytes: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+            let offset_buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("offsets"),
+                    contents: &offset_bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+            let results_len = std::mem::size_of_val(offsets) as u64;
+            // wgpu zero-initialises buffers, so results starts all-zero.
+            let results_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("results"),
+                size: results_len,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("results_staging"),
+                size: results_len,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            // Upload params {si_len, num_threads} (padded to 16 bytes).
+            let mut params = [0u8; 16];
+            params[0..4].copy_from_slice(&self.si_len.to_le_bytes());
+            params[4..8].copy_from_slice(&num_threads.to_le_bytes());
+            self.queue.write_buffer(&self.params_buf, 0, &params);
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hmac_sha256_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    bind(0, &self.signing_input_buf),
+                    bind(1, &self.params_buf),
+                    bind(2, &self.expected_sig_buf),
+                    bind(3, &candidate_buf),
+                    bind(4, &offset_buf),
+                    bind(5, &results_buf),
+                ],
+            });
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("hmac_sha256_encoder"),
+                });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("hmac_sha256_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                let workgroups = num_threads.div_ceil(WORKGROUP_SIZE);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            encoder.copy_buffer_to_buffer(&results_buf, 0, &staging_buf, 0, results_len);
+            self.queue.submit(Some(encoder.finish()));
+
+            // Map the staging buffer and block until the GPU finishes.
+            let slice = staging_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |res| {
+                let _ = tx.send(res);
+            });
+            self.device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .map_err(|e| anyhow::anyhow!("GPU poll failed: {e}"))?;
+            rx.recv()
+                .context("GPU result channel closed")?
+                .map_err(|e| anyhow::anyhow!("failed to map GPU results: {e}"))?;
+
+            let data = slice
+                .get_mapped_range()
+                .map_err(|e| anyhow::anyhow!("failed to read GPU results: {e}"))?;
+            let mut matches = Vec::new();
+            for (i, word) in data.chunks_exact(4).enumerate() {
+                if i == 0 {
+                    continue; // thread 0 reserved
+                }
+                if u32::from_le_bytes([word[0], word[1], word[2], word[3]]) != 0 {
+                    matches.push(i as u32);
+                }
+            }
+            drop(data);
+            staging_buf.unmap();
+
+            Ok(matches)
+        }
+    }
+
+    fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
+    fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+        wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }
+    }
+
+    fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: buffer.as_entire_binding(),
         }
     }
 }
