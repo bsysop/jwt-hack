@@ -174,6 +174,21 @@ pub fn charset_bytes(chars: &str) -> Vec<Vec<u8>> {
 /// Brute-forcing past this is computationally infeasible anyway.
 pub const MAX_BRUTE_LENGTH: usize = 64;
 
+/// Fill `indices[..length]` with the base-`charset_size` digits of `idx`,
+/// most-significant digit first (`indices[0]`). This is the single source of
+/// truth for brute-force candidate ordering, shared by the CPU
+/// ([`write_candidate_bytes`]) and GPU paths so the two can never drift.
+///
+/// Callers must ensure `length <= indices.len()` and `charset_size > 0`.
+#[inline]
+pub fn candidate_indices(idx: u64, charset_size: u64, length: usize, indices: &mut [u32]) {
+    let mut n = idx;
+    for i in (0..length).rev() {
+        indices[i] = (n % charset_size) as u32;
+        n /= charset_size;
+    }
+}
+
 /// Write the `idx`-th combination of `length` characters from `char_bytes`
 /// into `out`. `out` is cleared first; no allocation occurs once `out` has
 /// sufficient capacity. Iteration order matches the original
@@ -195,11 +210,7 @@ pub fn write_candidate_bytes(idx: u64, char_bytes: &[Vec<u8>], length: usize, ou
         return;
     }
     let mut indices = [0u32; MAX_BRUTE_LENGTH];
-    let mut n = idx;
-    for i in (0..length).rev() {
-        indices[i] = (n % charset_size) as u32;
-        n /= charset_size;
-    }
+    candidate_indices(idx, charset_size, length, &mut indices);
     for &i in indices.iter().take(length) {
         out.extend_from_slice(&char_bytes[i as usize]);
     }
@@ -332,6 +343,43 @@ mod tests {
         write_candidate_bytes(3, &char_bytes, 2, &mut buf);
         // idx 3 = 11 in base-2 → "글글"
         assert_eq!(buf.as_slice(), "글글".as_bytes());
+    }
+
+    #[test]
+    fn test_candidate_indices_is_base_n_msd_first() {
+        // idx 0 → all zero digits.
+        let mut indices = [9u32; MAX_BRUTE_LENGTH];
+        candidate_indices(0, 3, 3, &mut indices);
+        assert_eq!(&indices[..3], &[0, 0, 0]);
+
+        // idx 5 in base-3 is 012 (most-significant digit first).
+        candidate_indices(5, 3, 3, &mut indices);
+        assert_eq!(&indices[..3], &[0, 1, 2]);
+
+        // idx 26 in base-3 is 222 (the last 3-digit combination).
+        candidate_indices(26, 3, 3, &mut indices);
+        assert_eq!(&indices[..3], &[2, 2, 2]);
+    }
+
+    #[test]
+    fn test_candidate_indices_matches_write_candidate_bytes() {
+        // The shared helper must reproduce exactly the digits write_candidate_bytes uses.
+        let chars = "abcd";
+        let char_bytes = charset_bytes(chars);
+        let charset_size = char_bytes.len() as u64;
+        let length = 4;
+        let total = charset_size.pow(length as u32);
+        let mut buf = Vec::new();
+        let mut indices = [0u32; MAX_BRUTE_LENGTH];
+        for idx in 0..total {
+            write_candidate_bytes(idx, &char_bytes, length, &mut buf);
+            candidate_indices(idx, charset_size, length, &mut indices);
+            let via_indices: Vec<u8> = indices[..length]
+                .iter()
+                .flat_map(|&i| char_bytes[i as usize].clone())
+                .collect();
+            assert_eq!(buf, via_indices, "mismatch at idx {idx}");
+        }
     }
 
     #[test]

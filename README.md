@@ -67,7 +67,7 @@ docker pull hahwul/jwt-hack:v2.6.0
 | Encode  | JWT/JWE Encoder              | Secret based / Key based / Algorithm / Custom Header / DEFLATE Compression / JWE |
 | Decode  | JWT/JWE Decoder              | Algorithm, Issued At Check, DEFLATE Compression, JWE Structure |
 | Verify  | JWT Verifier                 | Secret based / Key based (for asymmetric algorithms)         |
-| Crack   | Secret Cracker               | Dictionary Attack / Brute Force / DEFLATE Compression        |
+| Crack   | Secret Cracker               | Dictionary Attack / Brute Force (GPU-accelerated on macOS) / DEFLATE Compression |
 | Payload | JWT Attack Payload Generator | none / jku&x5u / alg_confusion (signed via `--public-key`) / kid & claim injection / claims tampering / signature malleability / JWE probes / x5c / cty |
 | Scan    | Vulnerability Scanner        | Automated security checks for common JWT vulnerabilities     |
 | Server  | API Server                    | Run API Server Mode (http://localhost:3000)                 |
@@ -151,6 +151,25 @@ jwt-hack crack -w wordlist.txt COMPRESSED_JWT_TOKEN
 # Bruteforce attack
 jwt-hack crack -m brute JWT_TOKEN --max=4
 jwt-hack crack -m brute COMPRESSED_JWT_TOKEN --max=4
+
+# Force the CPU brute-force path (disable GPU acceleration)
+jwt-hack crack -m brute JWT_TOKEN --max=4 --no-gpu
+```
+
+#### GPU acceleration (macOS)
+
+On macOS, **HS256 brute-force cracking is GPU-accelerated by default** using a Metal compute backend. It automatically falls back to the CPU when no usable Metal device is present, and you can force the CPU path with `--no-gpu`.
+
+- **Available only when built from source of this fork** ([`bsysop/jwt-hack`](https://github.com/bsysop/jwt-hack)). The published packages (crates.io, Homebrew, Snapcraft, Chocolatey, Docker) are upstream and CPU-only.
+- **Supported GPUs:** Apple Silicon (M1+) and Intel Macs with an AMD/Intel GPU. NVIDIA GPUs and VM/Hackintosh setups are unsupported and fall back to the CPU automatically.
+- **Linux / Windows:** the GPU path is unavailable; brute force transparently uses the CPU and `--no-gpu` is a no-op.
+- **Scope:** only HS256 tokens use the GPU; other algorithms and JWE always use the CPU path.
+
+```bash
+# Build the GPU-enabled binary from source on macOS (Metal support is compiled in automatically)
+git clone https://github.com/bsysop/jwt-hack
+cd jwt-hack
+cargo build --release
 ```
 
 ### Generate payloads

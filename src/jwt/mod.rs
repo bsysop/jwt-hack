@@ -715,6 +715,15 @@ impl Hs256Verifier {
         calculated.zeroize();
         matches
     }
+
+    /// Consume the verifier and return the pre-computed signing input and
+    /// expected signature. Used by the GPU cracking path (in the binary crate),
+    /// which needs the raw material to upload to the device rather than the
+    /// `verify` helper. Unused in the library crate, hence `allow(dead_code)`.
+    #[allow(dead_code)]
+    pub(crate) fn into_parts(self) -> (Vec<u8>, Vec<u8>) {
+        (self.signing_input, self.expected_sig)
+    }
 }
 
 /// Build an [`Hs256Verifier`] from a JWT.

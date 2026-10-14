@@ -761,16 +761,75 @@ fn handle_verify(parts: &[&str], app: &mut App) {
     app.push_output(output.text);
 }
 
+const SHELL_DEFAULT_CHARSET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+
 fn handle_crack(parts: &[&str], app: &mut App, tx: &mpsc::Sender<AsyncResult>) {
-    let token = match resolve_token(parts, &app.session) {
+    // Parse a `dict`/`brute` mode keyword, brute-force tuning flags, and the
+    // token. The first non-flag argument is the token; otherwise the session
+    // token is used. `brute` mode uses the Metal GPU by default on macOS.
+    //
+    //   crack [dict|brute] [--no-gpu] [--min N] [--max N]
+    //         [--chars <set>] [--preset <name>] [<jwt>]
+    let mut mode = "dict";
+    let mut no_gpu = false;
+    let mut min: usize = 1;
+    let mut max: usize = 4;
+    let mut chars = SHELL_DEFAULT_CHARSET.to_string();
+    let mut preset: Option<String> = None;
+    let mut token_arg: Option<&str> = None;
+
+    // Parse `--flag value` pairs by index so a flag can consume its argument.
+    let args = &parts[1..];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "brute" => mode = "brute",
+            "dict" => mode = "dict",
+            "--no-gpu" => no_gpu = true,
+            "--min" | "--max" | "--chars" | "--preset" => {
+                let Some(value) = args.get(i + 1) else {
+                    app.push_error(&format!("Missing value for {}", args[i]));
+                    return;
+                };
+                match args[i] {
+                    "--min" => match value.parse::<usize>() {
+                        Ok(v) => min = v,
+                        Err(_) => {
+                            app.push_error(&format!("Invalid --min value: '{value}'"));
+                            return;
+                        }
+                    },
+                    "--max" => match value.parse::<usize>() {
+                        Ok(v) => max = v,
+                        Err(_) => {
+                            app.push_error(&format!("Invalid --max value: '{value}'"));
+                            return;
+                        }
+                    },
+                    "--chars" => chars = (*value).to_string(),
+                    "--preset" => preset = Some((*value).to_string()),
+                    _ => unreachable!(),
+                }
+                i += 1; // consume the value too
+            }
+            other if token_arg.is_none() => token_arg = Some(other),
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let token = match token_arg.or(app.session.token.as_deref()) {
         Some(t) => t.to_string(),
         None => {
-            app.push_error("No token provided. Use 'set token <jwt>' or 'crack <jwt>'");
+            app.push_error(
+                "No token provided. Use 'set token <jwt>' or \
+                 'crack [dict|brute] [--no-gpu] [--min N] [--max N] [--chars <set>] [--preset <name>] <jwt>'",
+            );
             return;
         }
     };
 
-    app.push_output_raw("  Cracking in background...");
+    app.push_output_raw(&format!("  Cracking ({mode}) in background..."));
 
     let session = app.session.clone();
     let tx = tx.clone();
@@ -778,15 +837,16 @@ fn handle_crack(parts: &[&str], app: &mut App, tx: &mpsc::Sender<AsyncResult>) {
         let output = capture::capture_command_output(|| {
             super::crack::execute(
                 &token,
-                "dict",
+                mode,
                 &session.wordlist,
-                "abcdefghijklmnopqrstuvwxyz0123456789",
-                &None,
+                &chars,
+                &preset,
                 20,
-                1, // min
-                4, // max
-                false,
-                false,
+                min,
+                max,
+                no_gpu, // no_gpu
+                false,  // power
+                false,  // verbose
                 &None,
                 &None,
             );

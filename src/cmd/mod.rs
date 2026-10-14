@@ -137,6 +137,10 @@ pub enum Commands {
         #[arg(long, default_value = "4")]
         max: usize,
 
+        /// Disable GPU acceleration and force the CPU brute-force path (macOS GPU is used by default)
+        #[arg(long)]
+        no_gpu: bool,
+
         /// Use all CPU cores
         #[arg(long)]
         power: bool,
@@ -379,6 +383,7 @@ pub fn execute() {
                 concurrency,
                 min,
                 max,
+                no_gpu,
                 power,
                 verbose,
                 target_field,
@@ -394,6 +399,7 @@ pub fn execute() {
                         *concurrency,
                         *min,
                         *max,
+                        *no_gpu,
                         *power,
                         *verbose,
                         target_field,
@@ -549,6 +555,7 @@ pub fn execute() {
             concurrency,
             min,
             max,
+            no_gpu,
             power,
             verbose,
             target_field,
@@ -574,6 +581,7 @@ pub fn execute() {
                 *concurrency,
                 *min,
                 *max,
+                *no_gpu,
                 *power,
                 *verbose,
                 target_field,

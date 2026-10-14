@@ -6,6 +6,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub mod cmd;
 pub mod config;
 pub mod crack;
+pub mod gpu;
 pub mod jwe_attacks;
 pub mod jwt;
 pub mod output;

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
 use crate::crack;
+use crate::gpu;
 use crate::jwt;
 use crate::printing::theme;
 use crate::utils;
@@ -42,6 +43,7 @@ pub struct CrackOptions<'a> {
     pub concurrency: usize,
     pub min: usize,
     pub max: usize,
+    pub no_gpu: bool,
     pub power: bool,
     pub verbose: bool,
     pub target_field: &'a Option<String>,
@@ -74,6 +76,7 @@ pub fn execute(
     concurrency: usize,
     min: usize,
     max: usize,
+    no_gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -88,6 +91,7 @@ pub fn execute(
         concurrency,
         min,
         max,
+        no_gpu,
         power,
         verbose,
         target_field,
@@ -107,6 +111,7 @@ pub fn execute_json(
     concurrency: usize,
     min: usize,
     max: usize,
+    no_gpu: bool,
     power: bool,
     verbose: bool,
     target_field: &Option<String>,
@@ -121,6 +126,7 @@ pub fn execute_json(
         concurrency,
         min,
         max,
+        no_gpu,
         power,
         verbose,
         target_field,
@@ -194,6 +200,44 @@ fn execute_with_options(options: &CrackOptions, emit_output: bool) {
             options.chars.to_string()
         };
 
+        // Validate the length bounds up front, before choosing GPU vs CPU, so an
+        // invalid --min/--max is reported once as a plain brute-force error
+        // rather than as a misleading "GPU failed, falling back to CPU" chain.
+        if let Err(e) = validate_brute_lengths(options.min, options.max) {
+            if emit_output {
+                utils::log_error(format!("Bruteforce cracking failed: {e}"));
+            }
+            return;
+        }
+
+        // Try the Metal GPU first for HS256 tokens; on any failure (no device,
+        // kernel compile error, unsupported token) fall back to the CPU path.
+        if gpu_brute_eligible(options, &chars_to_use, is_jwe) {
+            if emit_output {
+                utils::log_info(format!(
+                    "Using GPU (Metal — {})",
+                    gpu::availability_reason()
+                ));
+            }
+            match crack_bruteforce_gpu(
+                options.token,
+                &chars_to_use,
+                options.min,
+                options.max,
+                options.concurrency,
+                options.power,
+                options.verbose,
+                emit_output,
+            ) {
+                Ok(_) => return,
+                Err(e) => {
+                    if emit_output {
+                        utils::log_warning(format!("GPU failed ({e}), falling back to CPU"));
+                    }
+                }
+            }
+        }
+
         if let Err(e) = crack_bruteforce(
             options.token,
             &chars_to_use,
@@ -244,6 +288,24 @@ fn execute_with_options_json(options: &CrackOptions) -> anyhow::Result<CrackRepo
         } else {
             options.chars.to_string()
         };
+        // Validate length bounds before choosing GPU vs CPU so an invalid
+        // --min/--max surfaces as a clean error instead of a GPU failure.
+        validate_brute_lengths(options.min, options.max)?;
+        // Try the GPU first; fall through to the CPU path on any failure.
+        if gpu_brute_eligible(options, &chars_to_use, is_jwe) {
+            if let Ok(report) = crack_bruteforce_gpu(
+                options.token,
+                &chars_to_use,
+                options.min,
+                options.max,
+                options.concurrency,
+                options.power,
+                options.verbose,
+                emit_output,
+            ) {
+                return Ok(report);
+            }
+        }
         crack_bruteforce(
             options.token,
             &chars_to_use,
@@ -723,23 +785,8 @@ fn jwe_dir_key_reachable(charset: &str, min_len: usize, max_len: usize) -> bool 
     })
 }
 
-/// Streaming brute-force: each rayon worker materializes candidates from an
-/// integer index into a reusable byte buffer, avoiding the per-candidate
-/// `String` allocation of the legacy `Vec<String>` chunk path.
-#[allow(clippy::too_many_arguments)]
-fn crack_bruteforce(
-    token: &str,
-    chars: &str,
-    min_length: usize,
-    max_length: usize,
-    concurrency: usize,
-    power: bool,
-    verbose: bool,
-    is_jwe: bool,
-    emit_output: bool,
-) -> anyhow::Result<CrackReport> {
-    ensure_secret_crackable(token, is_jwe)?;
-
+/// Validate min/max length bounds shared by the CPU and GPU brute-force paths.
+fn validate_brute_lengths(min_length: usize, max_length: usize) -> anyhow::Result<()> {
     if min_length < 1 {
         anyhow::bail!("min length must be at least 1, got {}", min_length);
     }
@@ -757,6 +804,259 @@ fn crack_bruteforce(
             crack::brute::MAX_BRUTE_LENGTH
         );
     }
+    Ok(())
+}
+
+/// True when the brute-force request should attempt the Metal GPU first:
+/// GPU not disabled, not a JWE, a Metal device is present, the charset is
+/// GPU-safe (single-byte), and the token is HS256 (the only algorithm the
+/// kernel implements).
+fn gpu_brute_eligible(options: &CrackOptions, chars: &str, is_jwe: bool) -> bool {
+    !options.no_gpu
+        && !is_jwe
+        && gpu::is_available()
+        && charset_is_gpu_safe(chars)
+        && token_is_hs256(options.token)
+}
+
+/// Whether `chars` is safe to brute-force on the GPU.
+///
+/// The Metal kernel loads each candidate secret into a fixed 64-byte key block
+/// and skips any candidate longer than 64 bytes (it does not implement HMAC's
+/// key-hashing fallback for over-length keys). With a single-byte charset every
+/// candidate of length `n` is exactly `n` bytes, and [`validate_brute_lengths`]
+/// caps the length at `MAX_BRUTE_LENGTH` (64), so the kernel never skips a
+/// candidate and the GPU search is *exhaustive* — which is what lets the caller
+/// trust a GPU "not found" result and skip the CPU fallback. A multi-byte
+/// (non-ASCII) charset could produce candidates over 64 bytes that the kernel
+/// would silently skip while the CPU path would test them, so such charsets
+/// must stay on the CPU.
+fn charset_is_gpu_safe(chars: &str) -> bool {
+    chars.chars().all(|c| c.len_utf8() == 1)
+}
+
+/// Cheap one-time check that a token's header declares `alg: HS256`.
+fn token_is_hs256(token: &str) -> bool {
+    jwt::decode(token)
+        .ok()
+        .and_then(|d| {
+            d.header
+                .get("alg")
+                .and_then(|v| v.as_str())
+                .map(|a| a.eq_ignore_ascii_case("HS256"))
+        })
+        .unwrap_or(false)
+}
+
+/// GPU-accelerated HS256 brute-force via Metal (macOS only).
+///
+/// Candidate secrets for each batch are generated in parallel on the CPU (on a
+/// pool sized by `concurrency` / `power`, matching the CPU path), packed into a
+/// fixed-stride buffer, and dispatched to the GPU in `GPU_BATCH_SIZE`-sized
+/// chunks. Eligibility (GPU present, token is HS256, single-byte charset, not
+/// JWE) is checked by the caller via [`gpu_brute_eligible`]; this function
+/// additionally bails if the token is not HS256 or the charset is multi-byte,
+/// so it composes safely with the CPU fallback and is always exhaustive when it
+/// returns `Ok`.
+#[allow(clippy::too_many_arguments)]
+fn crack_bruteforce_gpu(
+    token: &str,
+    chars: &str,
+    min_length: usize,
+    max_length: usize,
+    concurrency: usize,
+    power: bool,
+    verbose: bool,
+    emit_output: bool,
+) -> anyhow::Result<CrackReport> {
+    validate_brute_lengths(min_length, max_length)?;
+
+    // Pull the signing material straight out of the HS256 verifier so the GPU
+    // path does not re-parse the token or re-decode base64 per candidate.
+    let (signing_input, expected_sig) = jwt::prepare_hs256_verifier(token)
+        .map_err(|e| anyhow::anyhow!("GPU requires an HS256 token: {e}"))?
+        .into_parts();
+    if expected_sig.len() != 32 {
+        anyhow::bail!(
+            "expected a 32-byte HS256 signature, got {} bytes",
+            expected_sig.len()
+        );
+    }
+
+    let char_bytes = crack::brute::charset_bytes(chars);
+    // Defense in depth (see `charset_is_gpu_safe`): the kernel skips candidates
+    // longer than 64 bytes, so a multi-byte charset could yield silent false
+    // negatives. The caller already excludes these; guard regardless so a GPU
+    // run is always exhaustive and the caller can trust `Ok(not found)` without
+    // a CPU re-run.
+    if char_bytes.iter().any(|b| b.len() != 1) {
+        anyhow::bail!("GPU path requires a single-byte (ASCII) charset");
+    }
+    // Single-byte charset is now guaranteed: flatten to one byte per character,
+    // so every candidate of length `n` is exactly `n` bytes (fixed stride).
+    let single: Vec<u8> = char_bytes.iter().map(|b| b[0]).collect();
+    let charset_size = single.len() as u64;
+
+    let start_time = Instant::now();
+    let total_combinations =
+        crack::brute::estimate_combinations(single.len(), min_length, max_length);
+    if emit_output {
+        utils::log_info(format!(
+            "GPU brute-force (Metal): {} total combinations (length {}..{})",
+            total_combinations, min_length, max_length
+        ));
+    }
+
+    let gpu = gpu::GpuCracker::new(&signing_input, &expected_sig)
+        .map_err(|e| anyhow::anyhow!("GPU initialisation failed: {e}"))?;
+
+    // Progress reporting mirrors the CPU brute path: a theme-styled, TTY-aware
+    // bar (hidden when stderr is not a terminal) instead of raw ANSI escapes,
+    // and suppressed in verbose mode.
+    let multi = if emit_output {
+        Some(MultiProgress::new())
+    } else {
+        None
+    };
+    let pb = if let Some(ref m) = multi {
+        create_crack_progress_bar(m, total_combinations, verbose)
+    } else {
+        None
+    };
+
+    // Candidate generation runs on the CPU; honour --concurrency / --power by
+    // sizing a dedicated rayon pool, matching the CPU brute-force path.
+    let pool = build_thread_pool(concurrency, power, "gpu-bruteforce")?;
+
+    // `found` stays an Arc<Mutex<..>> only to reuse `report_crack_results` /
+    // `build_crack_report`; the GPU driver loop below is single-threaded, so a
+    // plain counter is enough for the attempt total.
+    let found: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut attempts_total: usize = 0;
+
+    'length: for length in min_length..=max_length {
+        let total: u64 = charset_size.saturating_pow(length as u32);
+        // `saturating_pow` returns `u64::MAX` when `charset^length` overflows a
+        // u64 (e.g. 36^13). Such a length is skipped rather than searched, so
+        // the "exhaustive" guarantee technically does not cover it — but that
+        // keyspace is physically impossible to brute-force and the CPU path
+        // cannot finish it either, so there is no practical divergence. The
+        // same saturation can make `total_combinations` (and thus the progress
+        // bar's length) meaningless for such huge ranges; harmless, because
+        // `attempts_total` never approaches it.
+        if total == 0 || total == u64::MAX {
+            continue;
+        }
+        let num_batches = total.div_ceil(gpu::GPU_BATCH_SIZE);
+
+        for batch_idx in 0..num_batches {
+            let start_idx = batch_idx * gpu::GPU_BATCH_SIZE;
+            let end_idx = (start_idx + gpu::GPU_BATCH_SIZE).min(total);
+            let batch_size = (end_idx - start_idx) as usize;
+
+            // Fixed-stride packed layout: candidate `i` occupies
+            // `candidate_bytes[i*length..(i+1)*length]`, so `offsets` is purely
+            // arithmetic (`offsets[t] == t * length`, 1-based with
+            // `offsets[0] == 0`, matching the kernel's `offsets[tid-1]..offsets[tid]`).
+            // Writing straight into the packed buffer in parallel avoids the
+            // ~1M per-candidate heap allocations of the previous Vec<Vec<u8>>.
+            let mut candidate_bytes = vec![0u8; batch_size * length];
+            pool.install(|| {
+                candidate_bytes
+                    .par_chunks_mut(length)
+                    .enumerate()
+                    .for_each(|(i, chunk)| {
+                        // Share the exact candidate ordering with the CPU path
+                        // via `candidate_indices` (no drift). The index buffer
+                        // is a fixed stack array — no per-candidate heap alloc.
+                        let mut indices = [0u32; crack::brute::MAX_BRUTE_LENGTH];
+                        crack::brute::candidate_indices(
+                            start_idx + i as u64,
+                            charset_size,
+                            length,
+                            &mut indices,
+                        );
+                        for pos in 0..length {
+                            chunk[pos] = single[indices[pos] as usize];
+                        }
+                    });
+            });
+            let offsets: Vec<u32> = (0..=batch_size).map(|i| (i * length) as u32).collect();
+
+            let matches = gpu.crack_batch(&candidate_bytes, &offsets)?;
+            attempts_total += batch_size;
+
+            if let Some(ref progress) = pb {
+                progress.set_position(attempts_total as u64);
+                let elapsed = start_time.elapsed().as_secs_f64();
+                if elapsed > 0.0 {
+                    let rate = attempts_total as f64 / elapsed;
+                    progress.set_message(format!("({rate:.0} keys/sec, len {length})"));
+                }
+            }
+
+            if !matches.is_empty() {
+                // GPU thread IDs are 1-based (tid 0 is reserved); candidate
+                // index = tid - 1, at byte range [(tid-1)*length, tid*length).
+                let winner_tid = matches[0] as usize;
+                if winner_tid > 0 && winner_tid <= batch_size {
+                    let s = (winner_tid - 1) * length;
+                    let e = winner_tid * length;
+                    let secret =
+                        String::from_utf8(candidate_bytes[s..e].to_vec()).unwrap_or_default();
+                    if verbose {
+                        info!("Found! Token signature secret is {secret} Signature=Verified");
+                    }
+                    *found.lock().unwrap_or_else(|e| e.into_inner()) = Some(secret);
+                }
+                // Wipe this batch's plaintext candidate secrets before exiting,
+                // matching the CPU path's per-candidate `buf.zeroize()`.
+                candidate_bytes.zeroize();
+                break 'length;
+            }
+
+            // Wipe this batch's plaintext candidate secrets from memory, matching
+            // the CPU path's per-candidate `buf.zeroize()`.
+            candidate_bytes.zeroize();
+        }
+    }
+
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    let elapsed = start_time.elapsed();
+    report_crack_results(&found, elapsed, attempts_total, token, false, emit_output);
+
+    Ok(build_crack_report(
+        &found,
+        elapsed,
+        attempts_total,
+        false,
+        "brute:gpu",
+        None,
+        None,
+        emit_output,
+    ))
+}
+
+/// Streaming brute-force: each rayon worker materializes candidates from an
+/// integer index into a reusable byte buffer, avoiding the per-candidate
+/// `String` allocation of the legacy `Vec<String>` chunk path.
+#[allow(clippy::too_many_arguments)]
+fn crack_bruteforce(
+    token: &str,
+    chars: &str,
+    min_length: usize,
+    max_length: usize,
+    concurrency: usize,
+    power: bool,
+    verbose: bool,
+    is_jwe: bool,
+    emit_output: bool,
+) -> anyhow::Result<CrackReport> {
+    ensure_secret_crackable(token, is_jwe)?;
+    validate_brute_lengths(min_length, max_length)?;
 
     // JWE `dir` mode uses the guessed key directly as the content-encryption key,
     // which must be exactly 16 (A128GCM) or 32 (A256GCM) bytes. If no candidate in
@@ -1437,10 +1737,11 @@ mod tests {
                 "abcdefghijklmnopqrstuvwxyz",
                 &None, // preset
                 10,
-                1, // min
-                4, // max
-                false,
-                false,
+                1,     // min
+                4,     // max
+                false, // no_gpu
+                false, // power
+                false, // verbose
                 &None, // target_field
                 &None, // pattern
             );
@@ -1467,6 +1768,7 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1503,6 +1805,7 @@ mod tests {
             concurrency: 1,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &target,
@@ -1537,6 +1840,7 @@ mod tests {
             concurrency: 10,
             min: 1,
             max: 4,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1813,6 +2117,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1844,6 +2149,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1874,6 +2180,7 @@ mod tests {
             concurrency: 2,
             min: 1,
             max: 2,
+            no_gpu: false,
             power: false,
             verbose: false,
             target_field: &None,
@@ -1888,5 +2195,69 @@ mod tests {
             result.is_ok(),
             "execute_with_options should work without preset"
         );
+    }
+
+    /// Kernel-level GPU check: build a `GpuCracker` from a known token's
+    /// signing material and dispatch a small batch containing the correct
+    /// secret, asserting the matching 1-based thread id comes back. Skips when
+    /// no Metal device is available (e.g. a GPU-less CI runner).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_gpu_crack_batch_matches_known_secret() {
+        if !gpu::is_available() {
+            eprintln!("skipping: no Metal GPU available");
+            return;
+        }
+
+        let secret = "cab";
+        let token = create_test_token(secret);
+        let (signing_input, expected_sig) = jwt::prepare_hs256_verifier(&token)
+            .expect("HS256 token")
+            .into_parts();
+
+        let cracker =
+            gpu::GpuCracker::new(&signing_input, &expected_sig).expect("GPU cracker initialises");
+
+        // Pack three candidates: "zzz", the real secret, and "aaa".
+        let candidates = ["zzz", secret, "aaa"];
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut offsets: Vec<u32> = vec![0];
+        for c in &candidates {
+            bytes.extend_from_slice(c.as_bytes());
+            offsets.push(bytes.len() as u32);
+        }
+
+        let matches = cracker.crack_batch(&bytes, &offsets).expect("dispatch ok");
+        // Candidate `secret` is the 2nd candidate → 1-based thread id 2.
+        assert_eq!(matches, vec![2], "GPU should match only the correct secret");
+    }
+
+    /// Agreement test: the GPU brute-force path must find the same secret the
+    /// CPU path finds for a known HS256 token. Guards against the GPU kernel
+    /// silently producing false negatives on the default macOS path. Skips
+    /// gracefully when no Metal device is present.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_gpu_and_cpu_bruteforce_agree() {
+        if !gpu::is_available() {
+            eprintln!("skipping: no Metal GPU available");
+            return;
+        }
+
+        let secret = "cab";
+        let token = create_test_token(secret);
+
+        let gpu_report = crack_bruteforce_gpu(&token, "abc", 1, 3, 1, false, false, false)
+            .expect("GPU brute-force runs");
+        let cpu_report = crack_bruteforce(&token, "abc", 1, 3, 2, false, false, false, false)
+            .expect("CPU brute-force runs");
+
+        assert!(gpu_report.found, "GPU should find the secret");
+        assert!(cpu_report.found, "CPU should find the secret");
+        assert_eq!(
+            gpu_report.value, cpu_report.value,
+            "GPU and CPU must agree on the recovered secret"
+        );
+        assert_eq!(gpu_report.value.as_deref(), Some(secret));
     }
 }
