@@ -47,6 +47,10 @@ mimalloc = { version = "0.1", default-features = false }
 # default build so published packages and the native Metal path are unaffected.
 wgpu = { version = "30.0.1", optional = true }
 pollster = { version = "1.0.1", optional = true }
+# Used by the gpu-wgpu codegen test to compile the WGSL kernel to SPIR-V
+# (Vulkan/NVIDIA) and HLSL (DX12/Windows) — the backends wgpu itself picks on
+# those platforms. wgpu already builds naga, so this adds no new dependency.
+naga = { version = "30.0.1", optional = true, default-features = false, features = ["wgsl-in", "spv-out", "hlsl-out"] }
 
 [features]
 # Cross-vendor GPU brute force via wgpu/WGSL. When enabled it replaces the
@@ -54,7 +58,7 @@ pollster = { version = "1.0.1", optional = true }
 # macOS too). Requires a Vulkan/DX12/Metal/GL-capable GPU and driver at run
 # time; falls back to the CPU path when no usable adapter is found. MSRV for
 # this feature follows wgpu (currently 1.87.0, the project baseline).
-gpu-wgpu = ["dep:wgpu", "dep:pollster"]
+gpu-wgpu = ["dep:wgpu", "dep:pollster", "dep:naga"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.33"

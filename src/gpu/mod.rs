@@ -388,6 +388,17 @@ mod imp {
 
     impl GpuCracker {
         pub fn new(signing_input: &[u8], expected_sig: &[u8]) -> Result<Self> {
+            // The kernel compares exactly 8 big-endian words (32 bytes) of
+            // signature. A shorter buffer would make the shader read past the
+            // end (naga clamps out-of-bounds storage reads to 0), silently
+            // producing false negatives rather than an error — so reject it up
+            // front instead of trusting the caller.
+            if expected_sig.len() != 32 {
+                anyhow::bail!(
+                    "GPU backend requires a 32-byte HS256 signature, got {} bytes",
+                    expected_sig.len()
+                );
+            }
             let instance = new_instance();
             let adapter = request_adapter(&instance)?;
             let (device, queue) =
@@ -403,6 +414,28 @@ mod imp {
                     ..Default::default()
                 }))
                 .context("failed to create wgpu device")?;
+
+            // wgpu reports device errors through an uncaptured-error handler that
+            // panics by default — and the release profile is `panic = "abort"`,
+            // so such a panic would abort the process instead of letting
+            // `cmd::crack` fall back to the CPU. Install a non-panicking backstop
+            // so *no* error class (validation, out-of-memory, internal) can abort,
+            // and a device-lost callback so a GPU reset (e.g. a Windows TDR) is
+            // logged rather than fatal. The scopes below additionally convert the
+            // two realistic failure classes into a returned `Err` for a clean,
+            // correct CPU fallback instead of a swallowed error + false negative.
+            device.on_uncaptured_error(std::sync::Arc::new(|e| {
+                log::warn!("wgpu uncaptured error on GPU path: {e}");
+            }));
+            device.set_device_lost_callback(|reason, msg| {
+                log::warn!("wgpu device lost ({reason:?}): {msg}");
+            });
+
+            // Nested scopes: errors route to the innermost matching filter, so a
+            // validation error hits `val_scope` and an OOM hits `oom_scope`.
+            // WebGPU requires LIFO pop order (validation first, then OOM).
+            let oom_scope = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let val_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("hmac_sha256"),
@@ -456,6 +489,16 @@ mod imp {
                 mapped_at_creation: false,
             });
 
+            if let Some(err) = pollster::block_on(val_scope.pop()) {
+                anyhow::bail!(
+                    "GPU pipeline setup failed validation (likely a driver or limit \
+                     mismatch): {err}"
+                );
+            }
+            if let Some(err) = pollster::block_on(oom_scope.pop()) {
+                anyhow::bail!("GPU ran out of memory during setup: {err}");
+            }
+
             Ok(Self {
                 device,
                 queue,
@@ -478,6 +521,13 @@ mod imp {
             if num_threads <= 1 {
                 return Ok(Vec::new());
             }
+
+            // Capture validation and out-of-memory errors (the candidate buffer
+            // is the largest allocation and the most likely OOM) so a per-dispatch
+            // failure returns `Err` and the caller falls back to the CPU, rather
+            // than panicking/aborting. Popped LIFO, like `new`.
+            let oom_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let val_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
 
             let candidate_buf = self
                 .device
@@ -547,14 +597,32 @@ mod imp {
             encoder.copy_buffer_to_buffer(&results_buf, 0, &staging_buf, 0, results_len);
             self.queue.submit(Some(encoder.finish()));
 
+            // Surface any validation/OOM error from building/submitting this
+            // batch as an `Err` (CPU fallback) instead of a panic.
+            if let Some(err) = pollster::block_on(val_scope.pop()) {
+                anyhow::bail!("GPU dispatch failed validation: {err}");
+            }
+            if let Some(err) = pollster::block_on(oom_scope.pop()) {
+                anyhow::bail!("GPU ran out of memory during dispatch: {err}");
+            }
+
             // Map the staging buffer and block until the GPU finishes.
             let slice = staging_buf.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |res| {
                 let _ = tx.send(res);
             });
+            // Bounded wait rather than `wait_indefinitely()`: if the GPU hangs
+            // or the device is lost (e.g. a Windows TDR reset after a long
+            // dispatch), poll returns `PollError::Timeout` instead of blocking
+            // forever, and the caller falls back to the CPU. The limit is far
+            // above any real 1M-candidate HMAC dispatch (milliseconds to a few
+            // seconds), so it only trips on a genuinely wedged/software device.
             self.device
-                .poll(wgpu::PollType::wait_indefinitely())
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(120)),
+                })
                 .map_err(|e| anyhow::anyhow!("GPU poll failed: {e}"))?;
             rx.recv()
                 .context("GPU result channel closed")?
@@ -614,3 +682,54 @@ mod imp {
 }
 
 pub use imp::*;
+
+// ── Cross-backend codegen tests (opt-in: `--features gpu-wgpu`) ───────────────
+//
+// The default macOS test exercises only naga's Metal (MSL) backend. These
+// compile the exact WGSL kernel to the backends wgpu selects on the untested
+// platforms — SPIR-V for Vulkan (NVIDIA/AMD on Linux) and HLSL for DX12
+// (Windows) — so a codegen/validation problem on those paths is caught here
+// instead of only on real hardware.
+#[cfg(all(test, feature = "gpu-wgpu"))]
+mod codegen_tests {
+    const KERNEL_SRC: &str = include_str!("hmac_sha256.wgsl");
+
+    fn validated_module() -> (naga::Module, naga::valid::ModuleInfo) {
+        let module = naga::front::wgsl::parse_str(KERNEL_SRC).expect("WGSL kernel parses");
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("WGSL kernel passes naga validation");
+        (module, info)
+    }
+
+    /// Vulkan path (NVIDIA/AMD/Intel on Linux): WGSL → SPIR-V.
+    #[test]
+    fn wgsl_compiles_to_spirv_for_vulkan() {
+        let (module, info) = validated_module();
+        let spv =
+            naga::back::spv::write_vec(&module, &info, &naga::back::spv::Options::default(), None)
+                .expect("kernel generates SPIR-V (Vulkan/NVIDIA codegen path)");
+        assert!(!spv.is_empty(), "SPIR-V output is non-empty");
+        assert_eq!(spv[0], 0x0723_0203, "valid SPIR-V magic number");
+    }
+
+    /// DX12 path (NVIDIA/AMD/Intel on Windows): WGSL → HLSL.
+    #[test]
+    fn wgsl_compiles_to_hlsl_for_dx12() {
+        let (module, info) = validated_module();
+        let options = naga::back::hlsl::Options::default();
+        let pipeline_options = naga::back::hlsl::PipelineOptions::default();
+        let mut hlsl = String::new();
+        let mut writer = naga::back::hlsl::Writer::new(&mut hlsl, &options, &pipeline_options);
+        writer
+            .write(&module, &info, None)
+            .expect("kernel generates HLSL (DX12/Windows codegen path)");
+        assert!(
+            hlsl.contains("hmac_sha256_verify"),
+            "HLSL output contains the entry point"
+        );
+    }
+}

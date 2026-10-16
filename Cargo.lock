@@ -1980,6 +1980,7 @@ dependencies = [
  "log",
  "metal",
  "mimalloc",
+ "naga",
  "objc",
  "openssl",
  "pollster",
